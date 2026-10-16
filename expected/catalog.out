@@ -1,0 +1,76 @@
+SET search_path TO maludb_core, pg_catalog;
+SELECT count(*) AS catalog_tables
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'maludb_core'
+  AND c.relkind = 'r'
+  AND c.relname LIKE 'malu$%';
+ catalog_tables 
+----------------
+            161
+(1 row)
+
+SELECT count(*) AS object_types FROM malu$object_type;
+ object_types 
+--------------
+           31
+(1 row)
+
+SELECT count(*) AS relationship_types FROM malu$relationship_type;
+ relationship_types 
+--------------------
+                 16
+(1 row)
+
+SELECT count(*) AS source_types FROM malu$source_type;
+ source_types 
+--------------
+           12
+(1 row)
+
+SELECT object_type, stage FROM malu$object_type
+WHERE stage = 1
+ORDER BY object_type;
+    object_type     | stage 
+--------------------+-------
+ account            |     1
+ listener_config    |     1
+ mc2db_invocation   |     1
+ mc2db_prompt       |     1
+ mc2db_resource     |     1
+ mc2db_server       |     1
+ mc2db_tool         |     1
+ model_alias        |     1
+ model_provider     |     1
+ model_request      |     1
+ model_response     |     1
+ partition          |     1
+ prompt_render      |     1
+ prompt_template    |     1
+ session            |     1
+ session_context    |     1
+ vector_chunk       |     1
+ vector_compartment |     1
+ vector_subject     |     1
+ vector_verb        |     1
+(20 rows)
+
+INSERT INTO malu$account(account_name, account_kind, description)
+VALUES ('test_admin', 'admin', 'pg_regress smoke test row');
+SELECT account_name, account_kind, enabled
+FROM malu$account
+WHERE account_name = 'test_admin';
+ account_name | account_kind | enabled 
+--------------+--------------+---------
+ test_admin   | admin        | t
+(1 row)
+
+INSERT INTO malu$listener_config(listener_name) VALUES ('default');
+SELECT listener_name, bind_host, bind_port, tls_enabled
+FROM malu$listener_config
+WHERE listener_name = 'default';
+ listener_name | bind_host | bind_port | tls_enabled 
+---------------+-----------+-----------+-------------
+ default       | 127.0.0.1 |      5329 | f
+(1 row)
+

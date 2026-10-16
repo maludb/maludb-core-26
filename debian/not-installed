@@ -1,0 +1,5 @@
+# mc2dbd's `make install` stages its raw systemd unit into debian/tmp,
+# but the package ships an adjusted copy (paths + service user rewritten)
+# through override_dh_installsystemd in debian/rules instead. The staged
+# original is intentionally not installed.
+etc/systemd/system/maludb-mc2dbd.service

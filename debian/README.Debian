@@ -1,0 +1,56 @@
+maludb for Debian / Ubuntu
+==========================
+
+Two binary packages are produced from this source:
+
+  postgresql-17-maludb-core
+      The PGXS extension. Installs:
+        /usr/lib/postgresql/17/lib/maludb_core.so
+        /usr/share/postgresql/17/extension/maludb_core.control
+        /usr/share/postgresql/17/extension/maludb_core--*.sql
+
+      After install, run inside a database where you want MaluDB:
+          sudo -u postgres psql -d <db> -c \
+              'CREATE EXTENSION maludb_core CASCADE;'
+
+      The CASCADE pulls in vector (pgvector) automatically.
+
+  maludb-mc2dbd
+      The MC2DB listener daemon. Installs:
+        /usr/sbin/maludb_mc2dbd
+        /etc/maludb/maludb-mc2dbd.conf
+        /lib/systemd/system/maludb-mc2dbd.service
+        /usr/share/maludb/scripts/maludb-validate
+
+      The service is NOT auto-enabled. Wire credentials, optional
+      bearer token, and (for production) a real TLS cert into
+      /etc/maludb/maludb-mc2dbd.conf, then:
+          sudo systemctl enable --now maludb-mc2dbd
+          maludb-validate          # post-install acceptance check
+
+Building from source
+====================
+
+This is a native package (debian/source/format = 3.0 native). The
+authoritative dev/build host is Ubuntu 24.04 with PGDG PostgreSQL 17.
+On a fresh Ubuntu 24.04:
+
+    sudo apt-get install -y \
+        debhelper-compat (= 13) postgresql-server-dev-17 \
+        postgresql-server-dev-all postgresql-17-pgvector \
+        libpq-dev libmicrohttpd-dev libjansson-dev pkg-config
+
+    cd maludb-core
+    dpkg-buildpackage -b -us -uc
+
+The .deb files appear in the parent directory.
+
+Multi-PG-version
+================
+
+R1.0 targets PG 17 only. To add 16 or 18 in a future release:
+  - Add postgresql-server-dev-16 / -18 to Build-Depends in debian/control.
+  - In debian/rules, switch the override_dh_auto_build / override_dh_auto_install
+    blocks to iterate over `pg_buildext supported-versions`.
+  - Produce parallel binary packages postgresql-16-maludb-core and
+    postgresql-18-maludb-core.

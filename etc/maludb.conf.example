@@ -1,0 +1,14 @@
+# /etc/maludb/maludb.conf — shared MaluDB configuration (R1.0-9)
+#
+# Sourced by every MaluDB systemd unit (mc2dbd + modeld) BEFORE the
+# per-service conf file. Variables that differ between services
+# (notably PG_CONNINFO, which must match each daemon's OS user under
+# peer auth) live in the per-service conf, NOT here. KEY=VALUE;
+# lines starting with # are comments.
+
+# Database name MaluDB owns. Bootstrap creates this if absent.
+PG_DATABASE=maludb
+
+# Where MaluDB writes operational logs. Bootstrap creates this with
+# group maludb so both daemons can write.
+LOG_DIR=/var/log/maludb

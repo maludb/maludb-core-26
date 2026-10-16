@@ -1,0 +1,30 @@
+{
+  "tools": [
+    {
+      "name": "shell.echo",
+      "description": "Echo a string back. Useful for smoke-testing the broker.",
+      "kind": "shell",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {"type": "string"}
+        },
+        "required": ["text"]
+      },
+      "spec": {
+        "argv": ["/usr/bin/echo", "-n", "{{text}}"],
+        "timeout_ms": 1000
+      }
+    },
+    {
+      "name": "shell.uname",
+      "description": "Print kernel name + release. Read-only probe.",
+      "kind": "shell",
+      "input_schema": {"type": "object", "properties": {}},
+      "spec": {
+        "argv": ["/usr/bin/uname", "-sr"],
+        "timeout_ms": 1000
+      }
+    }
+  ]
+}

@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""V4 PageIndex / ChatIndex bench harness.
+
+Runs the deterministic `overlap` descent against fixture trees
+built from `bench/v4/fixtures/` and prints recall + latency
+baselines. Designed to be re-runnable and reproducible: the same
+fixtures + the same deterministic choice strategy yield the same
+selected leaves every run, so any drift is a regression worth
+investigating.
+
+Usage:
+    bench/v4/run-bench
+    bench/v4/run-bench --json
+    MALUDB_BENCH_DB=maludb bench/v4/run-bench
+
+Exit code: 0 on green, 1 on any failure (e.g. fixture didn't
+ingest cleanly).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import sys
+import time
+from pathlib import Path
+
+import psycopg
+
+
+HERE     = Path(__file__).resolve().parent
+FIXTURES = HERE / "fixtures"
+DB       = os.environ.get("MALUDB_BENCH_DB", "contrib_regression")
+TRIALS   = 20
+
+
+def _dsn() -> str:
+    parts = [f"dbname={DB}"]
+    for env, key in (
+        ("MALUDB_BENCH_HOST", "host"),
+        ("MALUDB_BENCH_PORT", "port"),
+        ("MALUDB_BENCH_USER", "user"),
+        ("MALUDB_BENCH_PASS", "password"),
+    ):
+        v = os.environ.get(env)
+        if v: parts.append(f"{key}={v}")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------
+# Fixture ingestion
+# ---------------------------------------------------------------------
+
+def _ingest_markdown_tree(cur, label: str) -> int:
+    body = (FIXTURES / "reference.md").read_text(encoding="utf-8")
+    cur.execute(
+        "SELECT register_source_package('document', NULL, %s, NULL, 'text/markdown')",
+        (body,))
+    sp = cur.fetchone()[0]
+    cur.execute("SELECT page_index_tree_register(%s, 'markdown')", (sp,))
+    tree_id = cur.fetchone()[0]
+    cur.execute("SELECT page_index_tree_mark_building(%s)", (tree_id,))
+
+    # Walk the markdown's heading hierarchy and insert page-index
+    # nodes that mirror it. We construct topic + leaf nodes by hand
+    # so the bench is independent of the live maludb-pageindexd
+    # service.
+    parsed = _parse_markdown_outline(body)
+    mdo_by_path: dict[tuple[str, ...], int] = {}
+    for entry in parsed:
+        path = entry["path"]
+        title = entry["title"]
+        summary = entry["summary"]
+        kind = "internal" if entry["has_children"] else "leaf"
+        parent = mdo_by_path.get(path[:-1])
+        cur.execute(
+            "SELECT mdo_id FROM page_index_record_node("
+            "  %s, %s, %s, %s, %s, NULL, NULL, NULL, NULL, NULL)",
+            (tree_id, parent, kind, title, summary))
+        mdo_by_path[path] = cur.fetchone()[0]
+
+    cur.execute("SELECT page_index_tree_mark_ready(%s)", (tree_id,))
+    return tree_id
+
+
+def _parse_markdown_outline(body: str) -> list[dict]:
+    """Return a list of {title, summary, path, has_children} entries
+    in document order."""
+    lines = body.splitlines()
+    headers: list[tuple[int, str]] = []
+    bodies: list[list[str]] = []
+    cur_body: list[str] = []
+    for line in lines:
+        if line.startswith("#"):
+            level = len(line) - len(line.lstrip("#"))
+            title = line.lstrip("#").strip()
+            if headers:
+                bodies.append(cur_body)
+                cur_body = []
+            headers.append((level, title))
+        else:
+            cur_body.append(line)
+    bodies.append(cur_body)
+
+    # Compute path-from-root using the level sequence.
+    entries = []
+    path_stack: list[str] = []
+    for i, (level, title) in enumerate(headers):
+        path_stack = path_stack[:level - 1] + [title]
+        # has_children = any later header at level+1 before another
+        # header at level <= current
+        has_children = False
+        for next_level, _ in headers[i + 1:]:
+            if next_level <= level:
+                break
+            if next_level == level + 1:
+                has_children = True
+                break
+        summary = " ".join(bodies[i]).strip()
+        if len(summary) > 200:
+            summary = summary[:200] + "…"
+        entries.append({
+            "title": title,
+            "summary": summary or title,
+            "path": tuple(path_stack),
+            "has_children": has_children,
+        })
+    return entries
+
+
+def _ingest_chat_tree(cur, label: str) -> int:
+    cur.execute(
+        "SELECT register_source_package('conversation', NULL, %s, NULL, "
+        "'application/json')",
+        ("[bench chat fixture]",))
+    sp = cur.fetchone()[0]
+    cur.execute("SELECT chat_index_tree_register(%s)", (sp,))
+    tree_id = cur.fetchone()[0]
+    cur.execute("SELECT chat_index_tree_mark_building(%s)", (tree_id,))
+    cur.execute("SELECT chat_index_tree_mark_ready(%s)", (tree_id,))
+
+    messages = []
+    for line in (FIXTURES / "chat.jsonl").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            messages.append(json.loads(line))
+    cur.execute(
+        "SELECT count(*) FROM chat_index_append_messages(%s, %s::jsonb)",
+        (tree_id, json.dumps(messages)))
+    cur.fetchone()
+    return tree_id
+
+
+# ---------------------------------------------------------------------
+# Bench queries
+# ---------------------------------------------------------------------
+
+PAGE_QUERIES = [
+    # (cue, expected leaf title fragment)
+    ("gamma delta capture",          "Step One"),
+    ("zeta iota transform",          "Step Two"),
+    ("kappa lambda sigma",           "Step Three"),
+    ("rho sigma load tau",           "Discussion"),
+    ("omega close",                  "Conclusion"),
+]
+
+CHAT_QUERIES = [
+    # (cue, expected message_index)
+    #
+    # The deterministic overlap strategy can only score against
+    # explicit text at the current level; auto-opened topic
+    # summaries don't propagate cue tokens down the tree. The
+    # bench therefore picks cues that ALL match root-level
+    # direct children (messages or topic node). When the 'llm'
+    # choice strategy lands post-GA, this list grows to exercise
+    # cross-topic recall too.
+    ("api gateway deploy",   0),
+    ("us-east-1 rollout",    1),
+    ("pricing pivot",        2),
+]
+
+
+def _bench_page(conn, tree_id: int, json_mode: bool) -> dict:
+    cur = conn.cursor()
+    results = []
+    for cue, expected in PAGE_QUERIES:
+        latencies = []
+        landed = None
+        depth = None
+        for _ in range(TRIALS):
+            t0 = time.perf_counter()
+            cur.execute(
+                "SELECT leaf_title, depth_reached "
+                "FROM retrieve_with_envelope_tree(%s, %s)",
+                (cue, tree_id))
+            row = cur.fetchone()
+            t1 = time.perf_counter()
+            latencies.append((t1 - t0) * 1000.0)
+            if landed is None:
+                landed, depth = row
+        match = bool(landed and expected in landed)
+        results.append({
+            "cue": cue,
+            "expected_leaf": expected,
+            "landed_leaf":   landed,
+            "depth":         depth,
+            "match":         match,
+            "p50_ms": round(statistics.median(latencies), 2),
+            "p95_ms": round(_pct(latencies, 95), 2),
+        })
+    return {
+        "tree_kind": "page_index",
+        "n_queries": len(PAGE_QUERIES),
+        "recall":    sum(r["match"] for r in results) / len(results),
+        "p95_ms_all": round(_pct(
+            [r["p95_ms"] for r in results], 95), 2),
+        "queries":   results,
+    }
+
+
+def _bench_chat(conn, tree_id: int, json_mode: bool) -> dict:
+    cur = conn.cursor()
+    results = []
+    for cue, expected in CHAT_QUERIES:
+        latencies = []
+        landed = None
+        for _ in range(TRIALS):
+            t0 = time.perf_counter()
+            cur.execute(
+                "SELECT leaf_mdo_id "
+                "FROM retrieve_with_envelope_chat_tree(%s, %s)",
+                (cue, tree_id))
+            row = cur.fetchone()
+            t1 = time.perf_counter()
+            latencies.append((t1 - t0) * 1000.0)
+            if landed is None:
+                landed = row[0] if row else None
+        cur.execute(
+            "SELECT message_index FROM malu$memory_detail_object "
+            "WHERE mdo_id = %s", (landed,))
+        msg_idx = cur.fetchone()
+        landed_index = msg_idx[0] if msg_idx else None
+        match = landed_index == expected
+        results.append({
+            "cue": cue,
+            "expected_message_index": expected,
+            "landed_message_index":   landed_index,
+            "match":                  match,
+            "p50_ms": round(statistics.median(latencies), 2),
+            "p95_ms": round(_pct(latencies, 95), 2),
+        })
+    return {
+        "tree_kind": "chat_index",
+        "n_queries": len(CHAT_QUERIES),
+        "recall":    sum(r["match"] for r in results) / len(results),
+        "p95_ms_all": round(_pct(
+            [r["p95_ms"] for r in results], 95), 2),
+        "queries":   results,
+    }
+
+
+def _pct(xs: list[float], pct: int) -> float:
+    if not xs: return 0.0
+    xs = sorted(xs)
+    k = max(0, min(len(xs) - 1, int(round(len(xs) * pct / 100)) - 1))
+    return xs[k]
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="run-bench")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    conn = psycopg.connect(_dsn(), autocommit=True)
+    with conn.cursor() as cur:
+        cur.execute("SET search_path TO maludb_core, public")
+        page_tree = _ingest_markdown_tree(cur, "bench-page")
+        chat_tree = _ingest_chat_tree(cur, "bench-chat")
+
+    page_report = _bench_page(conn, page_tree, args.json)
+    chat_report = _bench_chat(conn, chat_tree, args.json)
+
+    # Cleanup the fixture trees so re-runs don't accumulate.
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM malu$page_index_tree WHERE tree_id = %s",
+                    (page_tree,))
+        cur.execute("DELETE FROM malu$chat_index_tree WHERE tree_id = %s",
+                    (chat_tree,))
+    conn.close()
+
+    report = {
+        "build_host":     os.uname().nodename,
+        "trials":         TRIALS,
+        "page_index":     page_report,
+        "chat_index":     chat_report,
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        _emit_text(report)
+
+    rc = 0
+    if page_report["recall"] < 0.8:
+        print(f"FAIL: page_index recall {page_report['recall']:.2f} < 0.80")
+        rc = 1
+    if chat_report["recall"] < 0.8:
+        print(f"FAIL: chat_index recall {chat_report['recall']:.2f} < 0.80")
+        rc = 1
+    return rc
+
+
+def _emit_text(report: dict) -> None:
+    print(f"V4 bench  build_host={report['build_host']}  trials={report['trials']}")
+    for kind in ("page_index", "chat_index"):
+        r = report[kind]
+        print(f"\n--- {kind} ---")
+        print(f"  recall  = {r['recall']:.2f}   "
+              f"p95_all = {r['p95_ms_all']} ms   "
+              f"queries = {r['n_queries']}")
+        for q in r["queries"]:
+            tag = "✓" if q["match"] else "✗"
+            print(f"  {tag} cue={q['cue']!r:35s}  "
+                  f"p50={q['p50_ms']:>6.2f}ms  p95={q['p95_ms']:>6.2f}ms")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

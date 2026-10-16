@@ -1,0 +1,31 @@
+\set ECHO none
+dr_a_enabled
+t
+(1 row)
+ingested
+t
+(1 row)
+claim_picks_unindexed
+t
+(1 row)
+claim_returns_text
+t
+(1 row)
+statements_replaced|model
+1|claude-opus-4-8
+(1 row)
+has_new_edge|dropped_old_edge
+t|t
+(1 row)
+last_indexed_stamped|last_indexed_model
+t|claude-opus-4-8
+(1 row)
+note_search_finds_via_new_tags
+t
+(1 row)
+reindexed_not_reclaimed
+t
+(1 row)
+stale_reclaimed_by_watermark
+t
+(1 row)

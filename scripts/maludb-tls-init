@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# maludb-tls-init — generate a self-signed TLS cert for the MC2DB listener.
+# Phase R1.0-9.
+#
+# Default install uses self-signed; production deployments should
+# replace these with a real cert (Let's Encrypt, internal CA, etc.) or
+# front the listener with NGINX terminating TLS.
+
+set -euo pipefail
+
+OUT_DIR=/etc/maludb/tls
+OWNER=root
+GROUP=root
+HOST=localhost
+DAYS=365
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out-dir)  OUT_DIR=$2; shift 2 ;;
+        --owner)    OWNER=$2;   shift 2 ;;
+        --group)    GROUP=$2;   shift 2 ;;
+        --host)     HOST=$2;    shift 2 ;;
+        --days)     DAYS=$2;    shift 2 ;;
+        --help|-h)
+            sed -n '2,12p' "$0"; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+install -d -m 0750 -o "$OWNER" -g "$GROUP" "$OUT_DIR"
+
+KEY="$OUT_DIR/server.key"
+CRT="$OUT_DIR/server.crt"
+CSR_CONF=$(mktemp)
+trap 'rm -f "$CSR_CONF"' EXIT
+
+cat >"$CSR_CONF" <<EOF
+[req]
+distinguished_name = dn
+prompt             = no
+x509_extensions    = v3_ext
+
+[dn]
+CN = $HOST
+
+[v3_ext]
+subjectAltName     = DNS:$HOST, DNS:localhost, IP:127.0.0.1, IP:::1
+basicConstraints   = CA:FALSE
+keyUsage           = digitalSignature, keyEncipherment
+extendedKeyUsage   = serverAuth
+EOF
+
+openssl req -x509 -newkey rsa:2048 -days "$DAYS" \
+    -nodes \
+    -keyout "$KEY" \
+    -out    "$CRT" \
+    -config "$CSR_CONF" \
+    >/dev/null 2>&1
+
+chmod 0640 "$KEY" "$CRT"
+chown "$OWNER":"$GROUP" "$KEY" "$CRT"
+
+echo "wrote $CRT"
+echo "wrote $KEY"

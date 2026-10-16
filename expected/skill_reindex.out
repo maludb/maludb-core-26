@@ -1,0 +1,34 @@
+\set ECHO none
+skr_a_enabled
+t
+(1 row)
+claim_picks_unindexed
+t
+(1 row)
+claim_returns_body|claim_returns_old_subject|claim_returns_manual_subject
+t|t|t
+(1 row)
+replaced_subjects|written_subjects|replaced_verbs|replaced_keywords|model
+1|1|1|1|claude-opus-4-8
+(1 row)
+has_new_extracted_subject|keeps_manual_subject|dropped_old_extracted_subject
+t|t|t
+(1 row)
+has_new_extracted_verb|dropped_old_extracted_verb
+t|t
+(1 row)
+has_new_keyword|dropped_old_keyword
+t|t
+(1 row)
+last_indexed_stamped|last_indexed_model
+t|claude-opus-4-8
+(1 row)
+subject_facet_scored|match_reason_has_subject
+t|t
+(1 row)
+reindexed_skill_not_reclaimed
+t
+(1 row)
+stale_skill_reclaimed_by_watermark
+t
+(1 row)

@@ -1,0 +1,108 @@
+-- Stage 3 S3-1 — bitemporal columns.
+--
+-- Exercises:
+--   * register_* helpers still work with defaulted bitemporal columns
+--   * generated tstzrange columns reflect (start, end)
+--   * is_currently_valid / is_valid_at predicates
+--   * current views filter as expected
+--   * fact_as_of / memory_as_of / episode_as_of give point-in-time
+--   * GiST indexes for range queries
+
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+
+-- ---------- generic predicates --------------------------------------
+SELECT is_currently_valid(NULL, NULL)                          AS open_both;
+SELECT is_currently_valid(now() - interval '1 day', NULL)      AS open_end;
+SELECT is_currently_valid(NULL, now() + interval '1 day')      AS open_start;
+SELECT is_currently_valid(now() + interval '1 day', NULL)      AS future_start;
+SELECT is_currently_valid(NULL, now() - interval '1 day')      AS past_end;
+
+SELECT is_valid_at('2026-01-01 00:00Z'::timestamptz,
+                   '2026-12-31 23:59Z'::timestamptz,
+                   '2026-07-01 12:00Z'::timestamptz)           AS mid_window;
+SELECT is_valid_at('2026-01-01 00:00Z'::timestamptz,
+                   '2026-06-30 23:59Z'::timestamptz,
+                   '2026-07-01 12:00Z'::timestamptz)           AS past_window;
+
+-- ---------- register a fact and inspect bitemporal columns ----------
+SELECT register_fact(
+    p_claim_ids => ARRAY[]::bigint[],
+    p_subject   => 'pg_pool',
+    p_verb      => 'max_size',
+    p_object_value => '20',
+    p_statement_text => 'pool size set to 20'
+) AS fact_a \gset
+
+SELECT lifecycle_state,
+       valid_time_start IS NOT NULL    AS has_valid_start,
+       valid_time_end   IS NULL        AS valid_end_open,
+       transaction_time_start IS NOT NULL AS has_tx_start,
+       transaction_time_end IS NULL    AS tx_end_open
+FROM malu$fact WHERE fact_id = :fact_a;
+
+-- Generated range columns mirror the start/end pair
+SELECT lower(valid_time_range) = valid_time_start AS lower_matches,
+       upper(valid_time_range) IS NULL            AS upper_open
+FROM malu$fact WHERE fact_id = :fact_a;
+
+-- ---------- malu$current_fact view --------------------------------
+SELECT count(*) AS current_facts_count
+FROM malu$current_fact WHERE fact_id = :fact_a;
+
+-- Close the valid window (rewrite to a fully-past window so the
+-- generated range stays well-formed)
+UPDATE malu$fact
+   SET valid_time_start = '2025-01-01 00:00Z',
+       valid_time_end   = '2025-06-30 23:59Z'
+ WHERE fact_id = :fact_a;
+
+SELECT count(*) AS current_facts_after_close
+FROM malu$current_fact WHERE fact_id = :fact_a;
+
+-- ---------- as_of point-in-time -----------------------------------
+SELECT count(*) AS in_window
+FROM fact_as_of('2025-03-01 12:00Z')
+WHERE fact_id = :fact_a;
+
+SELECT count(*) AS before_window
+FROM fact_as_of('2024-12-15 12:00Z')
+WHERE fact_id = :fact_a;
+
+SELECT count(*) AS after_window
+FROM fact_as_of('2025-08-01 12:00Z')
+WHERE fact_id = :fact_a;
+
+-- ---------- closed window stays invisible in current view ---------
+SELECT count(*) AS current_after_window_close
+FROM malu$current_fact WHERE fact_id = :fact_a;
+
+-- ---------- memory + episode get the same machinery --------------
+SELECT register_memory(p_memory_kind=>'event', p_title=>'bitemporal test') AS mem_a \gset
+SELECT register_episode(p_episode_kind=>'migration', p_title=>'bitemporal test episode') AS ep_a \gset
+
+SELECT valid_time_range IS NOT NULL AS mem_has_range
+FROM malu$memory WHERE memory_id = :mem_a;
+SELECT valid_time_range IS NOT NULL AS ep_has_range
+FROM malu$episode_object WHERE episode_id = :ep_a;
+
+SELECT count(*) AS mem_in_current FROM malu$current_memory WHERE memory_id = :mem_a;
+SELECT count(*) AS ep_in_current  FROM malu$current_episode WHERE episode_id = :ep_a;
+
+-- ---------- transaction_time_end stays NULL until explicitly closed
+SELECT transaction_time_end IS NULL AS tx_open
+FROM malu$fact WHERE fact_id = :fact_a;
+
+-- ---------- stage_boundary: temporal columns are NOT a forbidden ---
+-- table name. malu$valid_time_window etc. were placeholders; we
+-- inline the columns now, so those names are no longer in the list.
+SELECT count(*) AS temporal_placeholder_violations
+FROM stage_boundary_violations()
+WHERE object_name LIKE 'malu$valid_time%'
+   OR object_name LIKE 'malu$transaction_time%';
+
+-- ---------- cleanup -----------------------------------------------
+DELETE FROM malu$fact     WHERE fact_id    = :fact_a;
+DELETE FROM malu$memory   WHERE memory_id  = :mem_a;
+DELETE FROM malu$episode_object WHERE episode_id = :ep_a;

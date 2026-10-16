@@ -1,0 +1,213 @@
+-- Stage 5 S5-2 — Skill Runtime as governed state machine.
+--
+-- Exercises (per requirements.md §3.9):
+--   * register_skill + add_skill_state + add_skill_transition build
+--     a small skill: start → step → {success_term | failure_term}.
+--   * begin_skill_execution: applicability matches → execution_id
+--     returned + initial step row recorded.
+--   * Applicability mismatch (wrong environment) raises check_violation.
+--   * step_skill_execution moves through transitions; outcome literal
+--     match preferred, then exception:* wildcard, then 'default'.
+--   * Terminal state finalises (completed_at + final_outcome set).
+--   * skill_emit_claim appends to emitted_claim_ids.
+--   * abort_skill_execution sets final_outcome='aborted'.
+--   * Stepping a finalised execution raises.
+--   * Audit events recorded.
+
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+
+-- ---------- register a skill ----------------------------------------
+SELECT register_skill(
+    p_skill_name           => 'deploy_canary',
+    p_version              => '1.0.0',
+    p_description          => 'Canary deploy with health-check validation.',
+    p_packaging_kind       => 'markdown',
+    p_applicability_jsonb  => jsonb_build_object(
+        'environment', 'prod',
+        'technology_stack', jsonb_build_array('helm','kubectl')),
+    p_precondition_jsonb   => jsonb_build_array(
+        jsonb_build_object('key','approval','op','=','value','granted'))
+) AS skill_id \gset
+
+-- Wire up the state machine.
+SELECT add_skill_state(:skill_id, 'plan',          'start')                      AS s_plan         \gset
+SELECT add_skill_state(:skill_id, 'shift_traffic', 'step')                       AS s_shift        \gset
+SELECT add_skill_state(:skill_id, 'health_check',  'validation')                 AS s_hc           \gset
+SELECT add_skill_state(:skill_id, 'rollback',      'exception_handler')          AS s_rb           \gset
+SELECT add_skill_state(:skill_id, 'success',       'terminal')                   AS s_success      \gset
+SELECT add_skill_state(:skill_id, 'failure',       'terminal')                   AS s_failure      \gset
+
+SELECT add_skill_transition(:skill_id, 'plan',          'shift_traffic', 'success');
+SELECT add_skill_transition(:skill_id, 'shift_traffic', 'health_check',  'success');
+SELECT add_skill_transition(:skill_id, 'health_check',  'success',       'success');
+SELECT add_skill_transition(:skill_id, 'health_check',  'rollback',      'failure');
+SELECT add_skill_transition(:skill_id, 'rollback',      'failure',       'success');
+-- Wildcard fall-through: any exception from shift_traffic routes to rollback.
+SELECT add_skill_transition(:skill_id, 'shift_traffic', 'rollback', 'exception:*');
+
+-- Exactly one start state — adding a second one raises.
+DO $body$
+BEGIN
+    PERFORM add_skill_state(
+        (SELECT skill_id FROM malu$skill_package WHERE skill_name = 'deploy_canary'),
+        'plan2', 'start');
+    RAISE NOTICE 'UNEXPECTED: second start state accepted';
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'OK: second start state rejected';
+END;
+$body$;
+
+-- ---------- applicability fail: wrong environment -------------------
+DO $body$
+BEGIN
+    PERFORM begin_skill_execution(
+        (SELECT skill_id FROM malu$skill_package WHERE skill_name = 'deploy_canary'),
+        p_environment => 'staging',
+        p_technology_stack => ARRAY['helm','kubectl']);
+    RAISE NOTICE 'UNEXPECTED: staging accepted';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: applicability rejected staging';
+END;
+$body$;
+
+-- ---------- applicability fail: missing tech --------------------------
+DO $body$
+BEGIN
+    PERFORM begin_skill_execution(
+        (SELECT skill_id FROM malu$skill_package WHERE skill_name = 'deploy_canary'),
+        p_environment => 'prod',
+        p_technology_stack => ARRAY['helm']);  -- missing kubectl
+    RAISE NOTICE 'UNEXPECTED: missing-tech accepted';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: applicability rejected missing tech';
+END;
+$body$;
+
+-- ---------- happy path execution ------------------------------------
+SELECT begin_skill_execution(
+    p_skill_id          => :skill_id,
+    p_environment       => 'prod',
+    p_technology_stack  => ARRAY['helm','kubectl','jq'],
+    p_task_objective    => 'deploy api-gateway v1.7'
+) AS exec_a \gset
+
+SELECT current_state_id = :s_plan AS current_is_start,
+       step_count
+FROM malu$skill_execution_record WHERE execution_id = :exec_a;
+
+SELECT step_skill_execution(:exec_a, 'success',
+    jsonb_build_object('note','plan complete')) AS next_state_1;
+
+SELECT step_skill_execution(:exec_a, 'success',
+    jsonb_build_object('note','traffic shifted')) AS next_state_2;
+
+-- Validation says success → terminal 'success'
+SELECT step_skill_execution(:exec_a, 'success',
+    jsonb_build_object('hc_ok',true)) AS terminal_state_a;
+
+SELECT final_outcome, completed_at IS NOT NULL AS finalised,
+       step_count
+FROM malu$skill_execution_record WHERE execution_id = :exec_a;
+
+-- Stepping a finalised execution raises.
+DO $body$
+DECLARE v_exec bigint := (SELECT execution_id FROM malu$skill_execution_record
+                          WHERE final_outcome = 'success' ORDER BY execution_id DESC LIMIT 1);
+BEGIN
+    PERFORM step_skill_execution(v_exec, 'success');
+    RAISE NOTICE 'UNEXPECTED: step on finalised accepted';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: step on finalised rejected';
+END;
+$body$;
+
+-- ---------- failure-branch execution --------------------------------
+SELECT begin_skill_execution(
+    p_skill_id         => :skill_id,
+    p_environment      => 'prod',
+    p_technology_stack => ARRAY['helm','kubectl']
+) AS exec_b \gset
+
+SELECT step_skill_execution(:exec_b, 'success');     -- plan → shift_traffic
+SELECT step_skill_execution(:exec_b, 'success');     -- shift_traffic → health_check
+SELECT step_skill_execution(:exec_b, 'failure',      -- health_check → rollback
+    jsonb_build_object('hc_ok',false,'reason','5xx')) AS next_state_failure_branch;
+
+SELECT step_skill_execution(:exec_b, 'success') AS terminal_state_b;  -- rollback → failure terminal
+
+SELECT final_outcome
+FROM malu$skill_execution_record WHERE execution_id = :exec_b;
+
+-- ---------- exception:* wildcard route -------------------------------
+SELECT begin_skill_execution(
+    p_skill_id         => :skill_id,
+    p_environment      => 'prod',
+    p_technology_stack => ARRAY['helm','kubectl']
+) AS exec_c \gset
+
+SELECT step_skill_execution(:exec_c, 'success');  -- plan → shift_traffic
+-- shift_traffic raises 'exception:NetworkTimeout' — there's no literal
+-- transition for it, but 'exception:*' wildcard routes to rollback.
+SELECT step_skill_execution(:exec_c, 'exception:NetworkTimeout',
+    jsonb_build_object('err','timeout')) AS wildcard_landed;
+
+SELECT step_skill_execution(:exec_c, 'success') AS terminal_state_c;
+
+SELECT final_outcome FROM malu$skill_execution_record WHERE execution_id = :exec_c;
+
+-- ---------- skill_emit_claim ----------------------------------------
+SELECT begin_skill_execution(
+    p_skill_id         => :skill_id,
+    p_environment      => 'prod',
+    p_technology_stack => ARRAY['helm','kubectl']
+) AS exec_d \gset
+
+SELECT register_claim(
+    p_subject        => 'api-gateway',
+    p_verb           => 'deployed',
+    p_object_value   => 'v1.7',
+    p_statement_text => 'Skill execution produced this evidentiary claim.'
+) AS claim_d \gset
+
+SELECT skill_emit_claim(:exec_d, :claim_d);
+
+SELECT cardinality(emitted_claim_ids) AS emitted_count,
+       emitted_claim_ids[1] = :claim_d AS first_emission_is_claim
+FROM malu$skill_execution_record WHERE execution_id = :exec_d;
+
+-- ---------- abort_skill_execution ------------------------------------
+SELECT abort_skill_execution(:exec_d, 'rolling-window cut over');
+
+SELECT final_outcome, audit_jsonb ->> 'abort_reason' AS abort_reason
+FROM malu$skill_execution_record WHERE execution_id = :exec_d;
+
+-- Aborting a finalised execution raises.
+DO $body$
+BEGIN
+    PERFORM abort_skill_execution(
+        (SELECT execution_id FROM malu$skill_execution_record
+         WHERE final_outcome = 'aborted' ORDER BY execution_id DESC LIMIT 1),
+        'should fail');
+    RAISE NOTICE 'UNEXPECTED: re-abort accepted';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: re-abort rejected';
+END;
+$body$;
+
+-- ---------- audit emission summary ---------------------------------
+SELECT event_kind, count(*) AS n
+FROM malu$audit_event
+WHERE event_kind LIKE 'skill_%'
+GROUP BY event_kind
+ORDER BY event_kind;
+
+-- ---------- cleanup -------------------------------------------------
+DELETE FROM malu$audit_event WHERE event_kind LIKE 'skill_%';
+DELETE FROM malu$skill_execution_step   WHERE execution_id IN (:exec_a, :exec_b, :exec_c, :exec_d);
+DELETE FROM malu$skill_execution_record WHERE execution_id IN (:exec_a, :exec_b, :exec_c, :exec_d);
+DELETE FROM malu$skill_transition       WHERE skill_id = :skill_id;
+DELETE FROM malu$skill_state            WHERE skill_id = :skill_id;
+DELETE FROM malu$skill_package          WHERE skill_id = :skill_id;
+DELETE FROM malu$claim                  WHERE claim_id = :claim_d;

@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# maludb-upgrade — install a new maludb_core build and upgrade a database to it.
+#
+# Automates the three manual steps of a version bump:
+#   1. (sudo) make install          — copy the new extension SQL + .so into place
+#   2. ALTER EXTENSION … UPDATE TO  — apply the X→Y upgrade chain in the database
+#   3. enable_memory_schema(schema) — re-point the tenant facades at the new version
+#
+# Version-agnostic: PostgreSQL walks the installed maludb_core--*.sql chain from
+# whatever version the database is currently at up to the target, so the same
+# script carries any N→M transition (including multi-step, e.g. 0.97.0→0.99.0).
+#
+# Usage:
+#   scripts/maludb-upgrade --version 0.99.0 --database maludb --schema app
+#   scripts/maludb-upgrade -v 0.99.0 -d maludb -s app [options]
+#
+# Required:
+#   -v, --version VER    target extension version (e.g. 0.99.0)
+#   -d, --database DB    database to upgrade
+#   -s, --schema SCH     tenant schema to (re-)enable  (or pass --all-schemas)
+#
+# Options:
+#   --all-schemas        (re-)enable every schema in malu$enabled_schema instead
+#                        of a single -s/--schema (loops the enable step)
+#   --pg-config PATH     pg_config to build/install against
+#                        (default: $PG_CONFIG or /usr/lib/postgresql/17/bin/pg_config)
+#   --skip-install       skip step 1 (make install); do the DB upgrade + enable only
+#   --repo PATH          repo root (default: the script's repo)
+#   --conninfo STR       explicit libpq conninfo for the SQL steps (overrides probing)
+#   -h, --help
+#
+# Connecting to PostgreSQL for the SQL steps, tried in order:
+#   1. --conninfo / $PG_CONNINFO   explicit override
+#   2. direct:  psql -d <db>       (your login role is a PG superuser / ext owner)
+#   3. sudo -n -u postgres psql    (passwordless sudo to the postgres account)
+# ALTER EXTENSION requires the extension owner (a superuser), so the resolved
+# role must be privileged.
+#
+# Exit: 0 on success; nonzero on the first failure.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+EXT=maludb_core
+
+VERSION=""
+DB_NAME=""
+SCHEMA=""
+PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/17/bin/pg_config}"
+PG_CONNINFO="${PG_CONNINFO:-}"
+SKIP_INSTALL=0
+ALL_SCHEMAS=0
+
+color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+step()  { color '36' "==> $*"; }
+ok()    { color '32' "PASS  $*"; }
+ko()    { color '31' "FAIL  $*"; }
+die()   { ko "$*"; exit 1; }
+
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# ---------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v|--version)  VERSION="$2"; shift 2 ;;
+        -d|--database) DB_NAME="$2"; shift 2 ;;
+        -s|--schema)   SCHEMA="$2"; shift 2 ;;
+        --pg-config)   PG_CONFIG="$2"; shift 2 ;;
+        --repo)        REPO_ROOT="$2"; shift 2 ;;
+        --conninfo)    PG_CONNINFO="$2"; shift 2 ;;
+        --skip-install) SKIP_INSTALL=1; shift ;;
+        --all-schemas) ALL_SCHEMAS=1; shift ;;
+        *=*)           # --opt=val form
+                       k="${1%%=*}"; v="${1#*=}"
+                       case "$k" in
+                           --version) VERSION="$v" ;;
+                           --database) DB_NAME="$v" ;;
+                           --schema) SCHEMA="$v" ;;
+                           --pg-config) PG_CONFIG="$v" ;;
+                           --repo) REPO_ROOT="$v" ;;
+                           --conninfo) PG_CONNINFO="$v" ;;
+                           *) die "unknown option: $k (try --help)" ;;
+                       esac
+                       shift ;;
+        -h|--help)     usage 0 ;;
+        *)             die "unknown argument: $1 (try --help)" ;;
+    esac
+done
+
+[ -n "$VERSION" ] || die "missing --version (try --help)"
+[ -n "$DB_NAME" ] || die "missing --database (try --help)"
+if [ "$ALL_SCHEMAS" -eq 0 ] && [ -z "$SCHEMA" ]; then
+    die "provide --schema SCH (or --all-schemas) (try --help)"
+fi
+
+# Defensive identifier checks — these go straight into SQL/shell.
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([.+-][A-Za-z0-9.+-]+)?$ ]] \
+    || die "version '$VERSION' is not a valid extension version (e.g. 0.99.0)"
+[[ "$DB_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "database '$DB_NAME' is not a simple identifier"
+if [ -n "$SCHEMA" ]; then
+    [[ "$SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "schema '$SCHEMA' is not a simple identifier"
+fi
+
+command -v psql >/dev/null 2>&1 || die "missing tool: psql"
+
+# ---------------------------------------------------------------------
+# How to run privileged SQL against DB_NAME (validate.sh's probe)
+# ---------------------------------------------------------------------
+if [ -n "$PG_CONNINFO" ]; then
+    Q_MODE=conninfo
+elif psql -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
+    Q_MODE=direct
+elif sudo -n -u postgres psql -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
+    Q_MODE=sudo
+else
+    die "cannot reach PostgreSQL database '$DB_NAME' (tried direct peer-auth, sudo -u postgres, \$PG_CONNINFO)"
+fi
+
+# q SQL  -> prints the scalar/first column result (ON_ERROR_STOP).
+q() {
+    case "$Q_MODE" in
+        conninfo) psql -X -q -t -A -v ON_ERROR_STOP=1 "$PG_CONNINFO" -c "$1" ;;
+        direct)   psql -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME"  -c "$1" ;;
+        sudo)     sudo -n -u postgres psql -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------
+step "maludb_core upgrade → $VERSION   db=$DB_NAME schema=$SCHEMA  (SQL via: $Q_MODE)"
+
+cur="$(q "SELECT extversion FROM pg_extension WHERE extname = '$EXT'" || true)"
+[ -n "$cur" ] || die "extension '$EXT' is not installed in '$DB_NAME' — run CREATE EXTENSION $EXT first"
+color '0' "    current extension version: $cur"
+
+# ---------------------------------------------------------------------
+# 1. Build + install the extension files (needs root for the file copy).
+# ---------------------------------------------------------------------
+if [ "$SKIP_INSTALL" -eq 0 ]; then
+    [ -x "$PG_CONFIG" ] || die "pg_config not executable: $PG_CONFIG (set --pg-config)"
+    SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+    step "make install   (PG_CONFIG=$PG_CONFIG${SUDO:+, via sudo})"
+    make -C "$REPO_ROOT" PG_CONFIG="$PG_CONFIG" >/dev/null
+    $SUDO make -C "$REPO_ROOT" install PG_CONFIG="$PG_CONFIG" >/dev/null
+
+    # The just-installed control should now advertise the target version.
+    ext_dir="$("$PG_CONFIG" --sharedir)/extension"
+    inst_ver="$(sed -n "s/^default_version *= *'\(.*\)'.*/\1/p" "$ext_dir/$EXT.control" 2>/dev/null || true)"
+    if [ -n "$inst_ver" ] && [ "$inst_ver" != "$VERSION" ]; then
+        color '33' "    WARN installed control default_version is '$inst_ver', not '$VERSION' — is the repo checkout on the target version?"
+    fi
+else
+    step "make install   (skipped: --skip-install)"
+fi
+
+# ---------------------------------------------------------------------
+# 2. Upgrade the extension in the database (chained X→Y automatically).
+# ---------------------------------------------------------------------
+if [ "$cur" = "$VERSION" ]; then
+    step "ALTER EXTENSION   (skipped: already at $VERSION)"
+else
+    step "ALTER EXTENSION $EXT UPDATE TO '$VERSION'   ($cur → $VERSION)"
+    q "ALTER EXTENSION $EXT UPDATE TO '$VERSION'" >/dev/null
+fi
+
+# ---------------------------------------------------------------------
+# 3. Re-enable the tenant schema(s) so their facades match the new version.
+# ---------------------------------------------------------------------
+fail=0
+
+# enable_one SCHEMA — (re)enable one schema and verify its enabled_version.
+enable_one() {
+    local sch="$1" sch_esc count ev
+    sch_esc="${sch//\'/\'\'}"   # SQL-literal-escape (names come from the DB under --all-schemas)
+    count="$(q "SELECT object_count FROM $EXT.enable_memory_schema('$sch_esc')")"
+    ev="$(q "SELECT enabled_version FROM $EXT.\"malu\$enabled_schema\" WHERE schema_name = '$sch_esc'")"
+    if [ "$ev" = "$VERSION" ]; then
+        ok "schema '$sch' enabled_version = $ev  (facades: $count)"
+    else
+        ko "schema '$sch' enabled_version = ${ev:-<none>} (expected $VERSION)"; fail=1
+    fi
+}
+
+if [ "$ALL_SCHEMAS" -eq 1 ]; then
+    [ -z "$SCHEMA" ] || color '33' "    WARN --all-schemas given; ignoring --schema '$SCHEMA'"
+    step "enable_memory_schema for every schema in malu\$enabled_schema"
+    mapfile -t SCHEMAS < <(q "SELECT schema_name FROM $EXT.\"malu\$enabled_schema\" ORDER BY schema_name")
+    if [ "${#SCHEMAS[@]}" -eq 0 ]; then
+        color '33' "    WARN no enabled schemas found in '$DB_NAME' — nothing to re-enable"
+    fi
+    for sch in "${SCHEMAS[@]}"; do
+        [ -n "$sch" ] && enable_one "$sch"
+    done
+else
+    step "enable_memory_schema('$SCHEMA')"
+    enable_one "$SCHEMA"
+fi
+
+# ---------------------------------------------------------------------
+# Verify the extension itself (schema-independent).
+# ---------------------------------------------------------------------
+ext_ver="$(q "SELECT extversion FROM pg_extension WHERE extname = '$EXT'")"
+fn_ver="$(q "SELECT $EXT.${EXT}_version()")"
+[ "$ext_ver" = "$VERSION" ] && ok "pg_extension.extversion = $ext_ver" || { ko "pg_extension.extversion = $ext_ver (expected $VERSION)"; fail=1; }
+[ "$fn_ver" = "$VERSION" ]  && ok "${EXT}_version() = $fn_ver"          || { ko "${EXT}_version() = $fn_ver (expected $VERSION)"; fail=1; }
+
+[ "$fail" -eq 0 ] || die "upgrade verification failed"
+if [ "$ALL_SCHEMAS" -eq 1 ]; then
+    step "Done — $DB_NAME (${#SCHEMAS[@]} schema(s)) on maludb_core $VERSION"
+else
+    step "Done — $DB_NAME / $SCHEMA is on maludb_core $VERSION"
+fi

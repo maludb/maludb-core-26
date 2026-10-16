@@ -1,0 +1,33 @@
+#!/bin/sh
+# Postinst for maludb-mc2dbd.
+#
+# Creates the system user that the listener runs as (if missing),
+# fixes permissions on /etc/maludb, /var/log/maludb, /var/lib/maludb.
+# Does NOT enable the unit — operators must run
+#   systemctl enable --now maludb-mc2dbd
+# after wiring credentials in /etc/maludb/maludb-mc2dbd.conf.
+
+set -e
+
+case "$1" in
+    configure)
+        if ! getent passwd maludb-mc2dbd >/dev/null; then
+            adduser --system --group --no-create-home \
+                    --home /var/lib/maludb \
+                    --shell /usr/sbin/nologin \
+                    maludb-mc2dbd
+        fi
+        install -d -o maludb-mc2dbd -g maludb-mc2dbd -m 0750 \
+            /etc/maludb /var/log/maludb /var/lib/maludb
+        # Lock down the config (may contain bearer token / TLS key path).
+        if [ -f /etc/maludb/maludb-mc2dbd.conf ]; then
+            chown maludb-mc2dbd:maludb-mc2dbd /etc/maludb/maludb-mc2dbd.conf
+            chmod 0640 /etc/maludb/maludb-mc2dbd.conf
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

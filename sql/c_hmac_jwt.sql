@@ -1,0 +1,176 @@
+-- V3-AUTH-02 — C-backed HMAC + JWT verifier regression coverage.
+
+SET search_path TO maludb_core, public;
+
+-- ---------------------------------------------------------------------
+-- Test 1: maludb_hmac_sha256 against an RFC 4231 test vector.
+--   key  = "Jefe", data = "what do ya want for nothing?"
+--   want = 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+-- ---------------------------------------------------------------------
+SELECT encode(
+    maludb_hmac_sha256('Jefe'::bytea, 'what do ya want for nothing?'::bytea),
+    'hex') AS rfc4231_test2;
+
+-- Empty input is well-defined.
+SELECT length(maludb_hmac_sha256('k'::bytea, ''::bytea)) AS empty_mac_len;
+
+-- ---------------------------------------------------------------------
+-- Test 2: __auth_token_hash now routes through the C primitive.
+-- Same plaintext -> same hash -> existing tokens still verify.
+-- We just sanity-check that the returned bytea has the right length
+-- (sha256 -> 32 bytes).
+-- ---------------------------------------------------------------------
+SELECT length(__auth_token_hash('mldbat_smoke')) AS hash_len;
+
+-- ---------------------------------------------------------------------
+-- Test 3: jwt_verify rejects malformed input.
+-- ---------------------------------------------------------------------
+DO $body$
+BEGIN
+    PERFORM * FROM jwt_verify('not-a-jwt');
+    RAISE EXCEPTION 'jwt_verify accepted obviously malformed input (test 3 fail)';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'jwt_verify rejects malformed input';
+END;
+$body$;
+
+-- ---------------------------------------------------------------------
+-- Test 4: jwt_verify rejects an HS256 JWT whose kid is not registered.
+-- ---------------------------------------------------------------------
+DO $body$
+BEGIN
+    -- Header: {"alg":"HS256","kid":"unknown-kid"}
+    -- Payload: {"account_id":"42"}
+    -- Signature: garbage (we never reach the verify step).
+    PERFORM * FROM jwt_verify(
+        'eyJhbGciOiJIUzI1NiIsImtpZCI6InVua25vd24ta2lkIn0' || '.' ||
+        'eyJhY2NvdW50X2lkIjoiNDIifQ' || '.' ||
+        'sig');
+    RAISE EXCEPTION 'jwt_verify accepted unknown kid (test 4 fail)';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'jwt_verify rejects unknown kid';
+END;
+$body$;
+
+-- ---------------------------------------------------------------------
+-- Test 5: HS256 happy path. We register a signing key, build a token
+-- against it using maludb_hmac_sha256 itself for symmetry, then call
+-- jwt_verify and expect the claim row back.
+-- ---------------------------------------------------------------------
+DO $body$
+DECLARE
+    v_secret  bytea  := convert_to('super-secret-test-key', 'UTF8');
+    v_k_b64u  text;
+    v_header  text;
+    v_payload text;
+    v_signed  text;
+    v_sig_b   bytea;
+    v_jwt     text;
+BEGIN
+    -- JWK 'k' field is base64url-encoded raw key bytes.
+    v_k_b64u  := translate(encode(v_secret, 'base64'), E'+/=\n', '-_');
+
+    INSERT INTO malu$jwt_signing_key(kid, kty, alg, public_jwk)
+    VALUES ('hs256-smoke', 'oct', 'HS256',
+            jsonb_build_object('k', v_k_b64u))
+    ON CONFLICT (kid) DO UPDATE
+        SET public_jwk = EXCLUDED.public_jwk, enabled = true;
+
+    -- Build the JWT. Header / payload are base64url-encoded UTF-8 JSON.
+    v_header  := translate(encode(convert_to(
+        '{"alg":"HS256","kid":"hs256-smoke","typ":"JWT"}', 'UTF8'),
+        'base64'), E'+/=\n', '-_');
+    v_payload := translate(encode(convert_to(
+        '{"account_id":"99","role_name":"agent","owner_schema":"public","active_pool":"7"}',
+        'UTF8'), 'base64'), E'+/=\n', '-_');
+    v_signed  := v_header || '.' || v_payload;
+    v_sig_b   := maludb_hmac_sha256(v_secret, v_signed::bytea);
+    v_jwt     := v_signed || '.' || translate(encode(v_sig_b, 'base64'),
+                                              E'+/=\n', '-_');
+
+    PERFORM 1 FROM jwt_verify(v_jwt);
+    RAISE NOTICE 'jwt_verify HS256 happy path accepts a well-formed token';
+END;
+$body$;
+
+-- Verify the claim row contents.
+WITH k AS (
+    SELECT convert_to('super-secret-test-key', 'UTF8') AS secret
+), j AS (
+    SELECT
+        translate(encode(convert_to(
+            '{"alg":"HS256","kid":"hs256-smoke","typ":"JWT"}', 'UTF8'),
+            'base64'), E'+/=\n', '-_') AS h,
+        translate(encode(convert_to(
+            '{"account_id":"99","role_name":"agent","owner_schema":"public","active_pool":"7"}',
+            'UTF8'), 'base64'), E'+/=\n', '-_') AS p,
+        secret
+      FROM k
+), s AS (
+    SELECT h, p, translate(encode(maludb_hmac_sha256(secret, (h||'.'||p)::bytea),
+                                  'base64'), E'+/=\n', '-_') AS sig
+      FROM j
+)
+SELECT account_id, role_name, owner_schema, active_pool
+  FROM jwt_verify((SELECT h||'.'||p||'.'||sig FROM s));
+
+-- ---------------------------------------------------------------------
+-- Test 6: tampered payload fails the signature check.
+-- ---------------------------------------------------------------------
+DO $body$
+DECLARE
+    v_secret  bytea := convert_to('super-secret-test-key', 'UTF8');
+    v_header  text  := translate(encode(convert_to(
+        '{"alg":"HS256","kid":"hs256-smoke"}', 'UTF8'),
+        'base64'), E'+/=\n', '-_');
+    v_payload text  := translate(encode(convert_to(
+        '{"account_id":"99"}', 'UTF8'),
+        'base64'), E'+/=\n', '-_');
+    v_signed  text  := v_header || '.' || v_payload;
+    v_sig     text  := translate(encode(
+        maludb_hmac_sha256(v_secret, v_signed::bytea),
+        'base64'), E'+/=\n', '-_');
+    v_tampered text;
+BEGIN
+    -- Swap a single byte of the payload section -> sig no longer
+    -- matches.
+    v_tampered := v_header || '.' ||
+                  translate(encode(convert_to('{"account_id":"77"}', 'UTF8'),
+                                   'base64'), E'+/=\n', '-_')
+                  || '.' || v_sig;
+    PERFORM * FROM jwt_verify(v_tampered);
+    RAISE EXCEPTION 'jwt_verify accepted tampered payload (test 6 fail)';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'jwt_verify rejects tampered HS256 payload';
+END;
+$body$;
+
+-- ---------------------------------------------------------------------
+-- Test 7: registered but unsupported algorithm yields
+-- feature_not_supported (RS/ES/EdDSA land in V3-AUTH-03).
+-- ---------------------------------------------------------------------
+INSERT INTO malu$jwt_signing_key(kid, kty, alg, public_jwk)
+VALUES ('rs256-stub', 'RSA', 'RS256', '{"n":"x","e":"AQAB"}'::jsonb)
+ON CONFLICT (kid) DO UPDATE
+    SET public_jwk = EXCLUDED.public_jwk, enabled = true;
+
+DO $body$
+DECLARE
+    v_header text := translate(encode(convert_to(
+        '{"alg":"RS256","kid":"rs256-stub"}', 'UTF8'),
+        'base64'), E'+/=\n', '-_');
+    v_payload text := translate(encode(convert_to(
+        '{"account_id":"1"}', 'UTF8'),
+        'base64'), E'+/=\n', '-_');
+BEGIN
+    PERFORM * FROM jwt_verify(v_header || '.' || v_payload || '.' || 'AAAA');
+    RAISE EXCEPTION 'jwt_verify accepted RS256 (test 7 fail)';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'jwt_verify rejects RS256 with feature_not_supported';
+END;
+$body$;
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$jwt_signing_key WHERE kid IN ('hs256-smoke', 'rs256-stub');

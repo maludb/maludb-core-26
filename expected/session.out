@@ -1,0 +1,134 @@
+SET search_path TO maludb_core, public;
+INSERT INTO malu$account(account_name, account_kind) VALUES ('alice', 'human');
+SELECT register_prompt_template(
+    'greeting',
+    E'Hello {{name}}, your task is {{task}}.',
+    'alice'
+) AS template_id;
+ template_id 
+-------------
+           1
+(1 row)
+
+SELECT start_session('alice', 'alias-stub', 'greeting') AS session_id \gset
+SELECT lifecycle_state, account_id IS NOT NULL AS account_bound,
+       model_alias_id IS NOT NULL AS alias_bound,
+       prompt_template_id IS NOT NULL AS template_bound
+FROM malu$session WHERE session_id = :session_id;
+ lifecycle_state | account_bound | alias_bound | template_bound 
+-----------------+---------------+-------------+----------------
+ open            | t             | t           | t
+(1 row)
+
+SELECT append_context(:session_id, 'system', 'You are a helpful assistant.', NULL, 'system_template') AS c1;
+ c1 
+----
+  1
+(1 row)
+
+SELECT append_context(:session_id, 'user',   'What is the weather?',          NULL, 'user') AS c2;
+ c2 
+----
+  2
+(1 row)
+
+SELECT append_context(:session_id, 'tool',   NULL,
+                      '{"tool":"clock","value":"2026-05-04T12:00Z"}'::jsonb,  'tool_call') AS c3;
+ c3 
+----
+  3
+(1 row)
+
+SELECT count(*) AS block_count FROM read_context(:session_id);
+ block_count 
+-------------
+           3
+(1 row)
+
+SELECT ordinal, role, source_label, sensitivity,
+       (content_hash IS NOT NULL) AS has_hash
+FROM read_context(:session_id) ORDER BY ordinal;
+ ordinal |  role  |  source_label   | sensitivity | has_hash 
+---------+--------+-----------------+-------------+----------
+       1 | system | system_template | internal    | t
+       2 | user   | user            | internal    | t
+       3 | tool   | tool_call       | internal    | t
+(3 rows)
+
+SELECT render_prompt(:session_id, 'greeting', NULL,
+                     '{"name":"Alice","task":"forecasting"}'::jsonb) AS render_id \gset
+SELECT context_block_count, length(rendered_prompt) > 0 AS rendered,
+       length(prompt_hash) AS hash_len, length(context_hash) AS context_hash_len
+FROM malu$prompt_render WHERE render_id = :render_id;
+ context_block_count | rendered | hash_len | context_hash_len 
+---------------------+----------+----------+------------------
+                   3 | t        |       64 |               64
+(1 row)
+
+SELECT submit_render(:render_id, 'alias-stub', 'alice') AS request_id \gset
+SELECT prompt_render_id = :render_id AS render_linked,
+       session_id = :session_id     AS session_linked,
+       prompt_hash = (SELECT prompt_hash FROM malu$prompt_render WHERE render_id=:render_id)
+       AS prompt_hash_linked
+FROM malu$model_request WHERE request_id = :request_id;
+ render_linked | session_linked | prompt_hash_linked 
+---------------+----------------+--------------------
+ t             | t              | t
+(1 row)
+
+SELECT mc_stub_process(:request_id);
+ mc_stub_process 
+-----------------
+               3
+(1 row)
+
+SELECT status,
+       output_text = 'MALUDB_STUB_REPLY:' ||
+                    (SELECT prompt_hash FROM malu$prompt_render WHERE render_id=:render_id)
+       AS output_matches_render_hash
+FROM get_response(:request_id);
+  status   | output_matches_render_hash 
+-----------+----------------------------
+ succeeded | t
+(1 row)
+
+SELECT clear_context(:session_id) AS cleared;
+ cleared 
+---------
+       3
+(1 row)
+
+SELECT count(*) AS blocks_after_clear FROM read_context(:session_id);
+ blocks_after_clear 
+--------------------
+                  0
+(1 row)
+
+SELECT close_session(:session_id);
+ close_session 
+---------------
+ closed
+(1 row)
+
+SELECT lifecycle_state, closed_at IS NOT NULL AS has_closed_at
+FROM malu$session WHERE session_id = :session_id;
+ lifecycle_state | has_closed_at 
+-----------------+---------------
+ closed          | t
+(1 row)
+
+SELECT start_session('no-such-account');
+ERROR:  unknown account: no-such-account
+CONTEXT:  PL/pgSQL function start_session(text,text,text,integer,integer) line 11 at RAISE
+SELECT append_context(999999, 'system', 'x');
+ERROR:  unknown session: 999999
+CONTEXT:  PL/pgSQL function append_context(bigint,text,text,jsonb,text,text,integer) line 15 at RAISE
+SELECT render_prompt(:session_id, 'no-such-template');
+ERROR:  unknown prompt template: no-such-template (version latest)
+CONTEXT:  PL/pgSQL function _render_core(bigint,text,integer,jsonb) line 26 at RAISE
+SQL statement "SELECT *             FROM _render_core(p_session_id, p_template_name,
+                                           p_template_version, p_variables)"
+PL/pgSQL function render_prompt(bigint,text,integer,jsonb) line 7 at SQL statement
+SELECT close_session(999999);
+ERROR:  unknown session: 999999
+CONTEXT:  PL/pgSQL function close_session(bigint,text) line 15 at RAISE

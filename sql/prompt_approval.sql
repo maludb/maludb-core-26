@@ -1,0 +1,189 @@
+-- R1.1-6: Prompt approval workflow.
+--
+-- Exercises:
+--   * default 'approved' status preserves R1.0 behavior
+--   * explicit status='draft' supported at INSERT
+--   * approve_prompt + deprecate_prompt + request_review state transitions
+--   * submit_render rejects draft + deprecated
+--   * bind_prompt rejects draft + deprecated
+--   * render_prompt + preview_prompt succeed on draft (author debugging)
+--   * safety_policy_id wiring
+--   * CHECK constraint blocks invalid status values
+
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+
+-- ---------- fixture ----------------------------------------------------
+INSERT INTO malu$account(account_name, account_kind, description) VALUES
+    ('pa_tenant',   'admin', 'R1.1-6 approval test tenant'),
+    ('pa_approver', 'admin', 'R1.1-6 approval test approver');
+
+-- new template, default status (should be 'approved')
+INSERT INTO malu$prompt_template (template_name, body) VALUES
+    ('pa_default', 'hello {{name}}');
+
+SELECT template_name, status, approved_at IS NULL AS no_approved_ts
+FROM malu$prompt_template WHERE template_name = 'pa_default';
+
+-- explicit draft
+INSERT INTO malu$prompt_template (template_name, body, status) VALUES
+    ('pa_explicit_draft', 'hello {{name}}', 'draft');
+
+SELECT template_name, status FROM malu$prompt_template WHERE template_name = 'pa_explicit_draft';
+
+-- CHECK constraint rejects invalid values
+DO $$ BEGIN
+    INSERT INTO malu$prompt_template (template_name, body, status)
+    VALUES ('pa_bad', 'x', 'garbage');
+    RAISE EXCEPTION 'should have rejected bad status';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: status CHECK rejects invalid value';
+END $$;
+
+-- ---------- approve_prompt --------------------------------------------
+SELECT approve_prompt('pa_explicit_draft',
+                     p_safety_policy=>'pii_redact',
+                     p_approver_account=>'pa_approver') > 0 AS approved;
+
+SELECT status, approved_at IS NOT NULL AS has_ts,
+       safety_policy_id IS NOT NULL AS has_policy,
+       approved_by_account_id IS NOT NULL AS has_approver
+FROM malu$prompt_template WHERE template_name = 'pa_explicit_draft';
+
+-- approving an already-approved template re-stamps approved_at but is
+-- otherwise a no-op
+SELECT approve_prompt('pa_default') > 0 AS re_approved;
+
+-- unknown safety_policy → error
+DO $$ BEGIN
+    PERFORM approve_prompt('pa_default', p_safety_policy=>'not_a_policy');
+    RAISE EXCEPTION 'should have rejected unknown policy';
+EXCEPTION WHEN no_data_found THEN
+    RAISE NOTICE 'OK: unknown safety_policy rejected';
+END $$;
+
+-- ---------- deprecate_prompt -------------------------------------------
+SELECT deprecate_prompt('pa_default', p_reason=>'replaced by pa_explicit_draft') > 0 AS deprecated;
+
+SELECT status, deprecation_reason FROM malu$prompt_template
+WHERE template_name = 'pa_default';
+
+-- approve a deprecated template: rejected (must rehab via UPDATE)
+DO $$ BEGIN
+    PERFORM approve_prompt('pa_default');
+    RAISE EXCEPTION 'should have rejected approve of deprecated';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: approve_prompt rejects deprecated';
+END $$;
+
+-- request_review a deprecated template: also rejected
+DO $$ BEGIN
+    PERFORM request_review('pa_default');
+    RAISE EXCEPTION 'should have rejected request_review on deprecated';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: request_review rejects deprecated';
+END $$;
+
+-- ---------- request_review --------------------------------------------
+SELECT request_review('pa_explicit_draft') > 0 AS moved_to_draft;
+
+SELECT status, approved_at IS NULL AS approved_ts_cleared
+FROM malu$prompt_template WHERE template_name = 'pa_explicit_draft';
+
+-- ---------- bind_prompt rejects non-approved ---------------------------
+-- pa_explicit_draft is now 'draft' again
+DO $$ BEGIN
+    PERFORM bind_prompt('pa_explicit_draft', jsonb_build_object('name','x'));
+    RAISE EXCEPTION 'should have rejected bind on draft';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: bind_prompt rejects draft';
+END $$;
+
+-- pa_default is 'deprecated'
+DO $$ BEGIN
+    PERFORM bind_prompt('pa_default', jsonb_build_object('name','x'));
+    RAISE EXCEPTION 'should have rejected bind on deprecated';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: bind_prompt rejects deprecated';
+END $$;
+
+-- ---------- submit_render rejects non-approved -------------------------
+-- We need a session so render_prompt works
+INSERT INTO malu$session (account_id, prompt_template_id)
+SELECT account_id, (SELECT template_id FROM malu$prompt_template WHERE template_name='pa_default')
+FROM malu$account WHERE account_name='pa_tenant'
+RETURNING session_id \gset
+
+-- render_prompt + preview_prompt succeed on a draft (author debugging)
+SELECT render_prompt(:session_id, 'pa_explicit_draft',
+                     p_variables=>jsonb_build_object('name','Draftee')) > 0 AS render_ok_on_draft
+\gset rd_
+
+-- preview also works (no INSERT side-effect)
+SELECT prompt_hash IS NOT NULL AS preview_ok_on_draft
+FROM preview_prompt(:session_id, 'pa_explicit_draft',
+                    p_variables=>jsonb_build_object('name','Previewer'));
+
+-- but submit_render rejects
+INSERT INTO malu$model_provider (provider_name, provider_kind, adapter_name)
+VALUES ('pa_provider', 'stub', 'stub_adapter');
+INSERT INTO malu$model_alias (alias_name, provider_id, model_identifier)
+VALUES ('pa_alias',
+        (SELECT provider_id FROM malu$model_provider WHERE provider_name='pa_provider'),
+        'pa-model');
+
+DO $$
+DECLARE
+    v_render_id bigint;
+BEGIN
+    SELECT render_id INTO v_render_id FROM malu$prompt_render
+    WHERE template_id = (SELECT template_id FROM malu$prompt_template WHERE template_name='pa_explicit_draft')
+    ORDER BY render_id DESC LIMIT 1;
+    PERFORM submit_render(v_render_id, 'pa_alias');
+    RAISE EXCEPTION 'should have rejected submit on draft render';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: submit_render rejects draft';
+END $$;
+
+-- approve the draft, submit_render now works
+SELECT approve_prompt('pa_explicit_draft') > 0 AS re_approved;
+
+DO $$
+DECLARE
+    v_render_id bigint;
+    v_request_id bigint;
+BEGIN
+    SELECT render_id INTO v_render_id FROM malu$prompt_render
+    WHERE template_id = (SELECT template_id FROM malu$prompt_template WHERE template_name='pa_explicit_draft')
+    ORDER BY render_id DESC LIMIT 1;
+    v_request_id := submit_render(v_render_id, 'pa_alias');
+    IF v_request_id IS NULL THEN
+        RAISE EXCEPTION 'submit_render returned NULL on approved render';
+    END IF;
+    RAISE NOTICE 'OK: submit_render accepts approved render (request_id=%)', v_request_id;
+END $$;
+
+-- and now bind_prompt works too
+SELECT bound_prompt_id > 0 AS bind_ok_post_approve
+FROM bind_prompt('pa_explicit_draft', jsonb_build_object('name','PostApprove'));
+
+-- ---------- safety_policy wiring --------------------------------------
+SELECT pt.template_name, sp.policy_name
+FROM malu$prompt_template pt
+LEFT JOIN malu$safety_policy sp ON sp.policy_id = pt.safety_policy_id
+WHERE pt.template_name = 'pa_explicit_draft';
+
+-- ---------- cleanup ----------------------------------------------------
+DELETE FROM malu$model_request WHERE alias_id =
+    (SELECT alias_id FROM malu$model_alias WHERE alias_name='pa_alias');
+DELETE FROM malu$bound_prompt WHERE template_id IN
+    (SELECT template_id FROM malu$prompt_template WHERE template_name IN ('pa_default','pa_explicit_draft'));
+DELETE FROM malu$prompt_render WHERE template_id IN
+    (SELECT template_id FROM malu$prompt_template WHERE template_name IN ('pa_default','pa_explicit_draft'));
+DELETE FROM malu$session_context WHERE session_id = :session_id;
+DELETE FROM malu$session WHERE session_id = :session_id;
+DELETE FROM malu$prompt_template WHERE template_name IN ('pa_default','pa_explicit_draft');
+DELETE FROM malu$model_alias WHERE alias_name='pa_alias';
+DELETE FROM malu$model_provider WHERE provider_name='pa_provider';
+DELETE FROM malu$account WHERE account_name IN ('pa_tenant','pa_approver');

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maludb-restd"
+version = "0.1.0"
+description = "MaluDB REST gateway — curated HTTP API over governed memory, retrieval, model, and tool operations."
+readme = "README.md"
+license = { text = "PostgreSQL" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Edward Honour", email = "ed@maludb.org" }
+]
+keywords = ["maludb", "rest", "api", "gateway", "postgres"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: PostgreSQL License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+
+dependencies = [
+    # psycopg ships in the project's existing driver; reusing keeps the
+    # operational footprint identical. A psycopg_pool.ConnectionPool
+    # upgrade is a one-file refactor once the daemon needs to scale.
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+]
+
+[project.scripts]
+maludb-restd = "maludb_restd.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maludb_restd"]

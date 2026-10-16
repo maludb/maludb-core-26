@@ -1,0 +1,150 @@
+-- Stage 4 S4-4 — Query-hint API.
+--
+-- Exercises:
+--   * register_query_hint upsert
+--   * apply_hints: suppress_path drops listed strategies
+--   * apply_hints: force_path reorders listed strategies first
+--   * apply_hints: intent_override re-derives strategies
+--   * apply_hints: confidence_floor + time constraints mutate envelope
+--   * apply_hints: boost_weight annotates listed strategies
+--   * plan_retrieval_with_hints inline hints + named hint compose
+--   * audit emitted when plan is rewritten
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- register a named hint ------------------------------------
+SELECT register_query_hint(
+    'recall_high',
+    jsonb_build_object(
+        'force_path', jsonb_build_array('fuzzy_subject','fts'),
+        'suppress_path', jsonb_build_array('graph_walk'),
+        'boost_weight', jsonb_build_object('fts', 2.0))
+) AS hint_id \gset
+SELECT hint_name, hint_jsonb ? 'force_path' AS has_force,
+       hint_jsonb ? 'suppress_path' AS has_suppress
+FROM malu$query_hint WHERE hint_id = :hint_id;
+  hint_name  | has_force | has_suppress 
+-------------+-----------+--------------
+ recall_high | t         | t
+(1 row)
+
+-- ---------- apply_hints: suppress + force_path -----------------------
+WITH env AS (
+    SELECT ROW('something broad and free text',
+               ARRAY['claim','fact']::text[], NULL, NULL, NULL, NULL)
+           ::malu$retrieval_envelope_t AS e
+),
+base AS (
+    SELECT plan_retrieval(e) AS p FROM env
+),
+applied AS (
+    SELECT apply_hints((SELECT p FROM base),
+        jsonb_build_object(
+            'force_path',    jsonb_build_array('vector'),
+            'suppress_path', jsonb_build_array('graph_walk'))) AS p
+)
+SELECT
+    (SELECT (p).strategies -> 0 ->> 'strategy' FROM applied) AS first_strategy,
+    (SELECT jsonb_array_length((p).strategies) FROM applied) AS strategy_count;
+ first_strategy | strategy_count 
+----------------+----------------
+ vector         |              2
+(1 row)
+
+-- ---------- intent_override re-derives strategies -------------------
+WITH applied AS (
+    SELECT apply_hints(
+        plan_retrieval(ROW('plain text',
+                           ARRAY['fact']::text[], NULL, NULL, NULL, NULL)
+                       ::malu$retrieval_envelope_t),
+        jsonb_build_object('intent_override', 'recall')) AS p
+)
+SELECT (p).intent AS overridden_intent,
+       (p).strategies -> 0 ->> 'strategy' AS first_strat
+FROM applied;
+ overridden_intent |  first_strat  
+-------------------+---------------
+ recall            | fuzzy_subject
+(1 row)
+
+-- ---------- confidence_floor_override mutates envelope --------------
+WITH applied AS (
+    SELECT apply_hints(
+        plan_retrieval(ROW('plain text',
+                           ARRAY['fact']::text[], NULL, NULL, NULL, NULL)
+                       ::malu$retrieval_envelope_t),
+        jsonb_build_object('confidence_floor_override', 0.75)) AS p
+)
+SELECT (p).intent AS new_intent,
+       (p).envelope -> 'confidence_floor' AS floor_in_envelope
+FROM applied;
+ new_intent | floor_in_envelope 
+------------+-------------------
+ broad      | 0.75
+(1 row)
+
+-- ---------- boost_weight annotates strategies ----------------------
+WITH applied AS (
+    SELECT apply_hints(
+        plan_retrieval(ROW('plain text',
+                           ARRAY['fact']::text[], NULL, NULL, NULL, NULL)
+                       ::malu$retrieval_envelope_t),
+        jsonb_build_object('boost_weight',
+            jsonb_build_object('fts', 2.5, 'vector', 1.5))) AS p
+)
+SELECT
+    (SELECT s ->> 'strategy' FROM jsonb_array_elements((p).strategies) s
+      WHERE s ->> 'strategy' = 'fts') AS fts_present,
+    (SELECT s -> 'boost' FROM jsonb_array_elements((p).strategies) s
+      WHERE s ->> 'strategy' = 'fts')::text AS fts_boost
+FROM applied;
+ fts_present | fts_boost 
+-------------+-----------
+ fts         | 2.5
+(1 row)
+
+-- ---------- plan_retrieval_with_hints + named hint ------------------
+SELECT (plan_retrieval_with_hints(
+    ROW('plain text',
+        ARRAY['fact']::text[], NULL, NULL, NULL, NULL)
+    ::malu$retrieval_envelope_t,
+    'recall_high'
+)).strategies -> 0 ->> 'strategy' AS first_under_named_hint;
+ first_under_named_hint 
+------------------------
+ fts
+(1 row)
+
+-- Unknown hint raises
+SELECT plan_retrieval_with_hints(
+    ROW('plain text', ARRAY['fact']::text[], NULL, NULL, NULL, NULL)
+    ::malu$retrieval_envelope_t,
+    'no_such_hint');
+ERROR:  plan_retrieval_with_hints: unknown or disabled hint no_such_hint
+CONTEXT:  PL/pgSQL function plan_retrieval_with_hints("malu$retrieval_envelope_t",text) line 19 at RAISE
+-- ---------- audit row emitted when hint rewrites the plan -----------
+SELECT count(*) AS audit_rows
+FROM malu$audit_event
+WHERE event_kind = 'plan_hints_applied'
+  AND event_jsonb ->> 'hint_name' = 'recall_high';
+ audit_rows 
+------------
+          1
+(1 row)
+
+-- ---------- NULL / empty hints are no-op ----------------------------
+WITH base AS (
+    SELECT plan_retrieval(ROW('plain text',
+                              ARRAY['fact']::text[], NULL, NULL, NULL, NULL)
+                          ::malu$retrieval_envelope_t) AS p
+)
+SELECT (apply_hints((SELECT p FROM base), NULL)).intent      AS null_hint_intent,
+       (apply_hints((SELECT p FROM base), '{}'::jsonb)).intent AS empty_hint_intent;
+ null_hint_intent | empty_hint_intent 
+------------------+-------------------
+ broad            | broad
+(1 row)
+
+-- ---------- cleanup -------------------------------------------------
+DELETE FROM malu$audit_event WHERE event_kind = 'plan_hints_applied';
+DELETE FROM malu$query_hint  WHERE hint_id = :hint_id;

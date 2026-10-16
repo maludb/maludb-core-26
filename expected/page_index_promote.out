@@ -1,0 +1,288 @@
+-- V4 Stage 17 V4-PAGEINDEX-02 — promotion path + builder substrate.
+--
+-- Exercises:
+--   1. source_package_promote_to_page_index registers a tree, auto-
+--      registers the pageindex_build queue, enqueues a payload, and
+--      writes a page_index_tree.promote audit row.
+--   2. Re-promoting under the same source package opens a fresh tree
+--      and (after the caller marks the prior tree ready and calls
+--      page_index_tree_supersede) leaves a supersedes edge.
+--   3. page_index_record_structure_pass writes a malu$structure_pass_audit
+--      row with the parser kind/version, outline_node_count, leaf_count,
+--      and deterministic_inputs_hash.
+--   4. Determinism: two structure passes with the same parser_kind +
+--      parser_version + deterministic_inputs_hash produce identical
+--      audit rows.
+--   5. RLS: a source package owned by tenant A cannot be promoted by
+--      tenant B (the FK enforcement plus RLS visibility makes the
+--      target row invisible, so the call fails).
+--   6. Atomicity: page_index_record_node inserts MDO + ledger in one
+--      transaction; if the ledger insert raises, the MDO row does not
+--      land.
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- fixture: a Source Package to anchor trees to -------------
+SELECT register_source_package(
+    p_source_type  => 'document',
+    p_content_text => 'V4-PAGEINDEX-02 promotion fixture.',
+    p_media_type   => 'text/plain'
+) AS sp_id \gset
+-- ====================================================================
+-- 1. Promote: tree + queue job + audit row.
+-- ====================================================================
+SELECT source_package_promote_to_page_index(
+    p_source_package_id  => :sp_id,
+    p_parser_kind        => 'pdf',
+    p_builder_options    => '{"max_depth": 6}'::jsonb
+) AS tree_a \gset
+SELECT build_status, parser_kind, source_package_id = :sp_id AS source_matches
+FROM malu$page_index_tree WHERE tree_id = :tree_a;
+ build_status | parser_kind | source_matches 
+--------------+-------------+----------------
+ pending      | pdf         | t
+(1 row)
+
+SELECT count(*) AS promote_audit_rows
+FROM malu$audit_event
+WHERE event_kind = 'page_index_tree.promote'
+  AND target_object_id = :tree_a;
+ promote_audit_rows 
+--------------------
+                  1
+(1 row)
+
+-- Queue auto-registered and a job was enqueued.
+SELECT name FROM malu$queue WHERE name = 'pageindex_build';
+      name       
+-----------------
+ pageindex_build
+(1 row)
+
+SELECT count(*) AS pageindex_jobs_for_tree_a
+FROM malu$queue_job j
+JOIN malu$queue q ON q.queue_id = j.queue_id
+WHERE q.name = 'pageindex_build'
+  AND j.payload ->> 'tree_id' = :tree_a::text;
+ pageindex_jobs_for_tree_a 
+---------------------------
+                         1
+(1 row)
+
+-- ====================================================================
+-- 2. Re-promotion + supersession.
+-- ====================================================================
+-- Promote_to_page_index always opens a new tree row; the caller
+-- decides whether to supersede the prior one.
+SELECT page_index_tree_mark_building(:tree_a);
+ page_index_tree_mark_building 
+-------------------------------
+ 
+(1 row)
+
+SELECT page_index_tree_mark_ready(:tree_a);
+ page_index_tree_mark_ready 
+----------------------------
+ 
+(1 row)
+
+SELECT source_package_promote_to_page_index(:sp_id, 'pdf') AS tree_b \gset
+SELECT page_index_tree_mark_building(:tree_b);
+ page_index_tree_mark_building 
+-------------------------------
+ 
+(1 row)
+
+SELECT page_index_tree_mark_ready(:tree_b);
+ page_index_tree_mark_ready 
+----------------------------
+ 
+(1 row)
+
+SELECT page_index_tree_supersede(:tree_a, :tree_b) AS edge_id \gset
+SELECT build_status, superseded_by = :tree_b AS points_at_new
+FROM malu$page_index_tree WHERE tree_id = :tree_a;
+ build_status | points_at_new 
+--------------+---------------
+ superseded   | t
+(1 row)
+
+SELECT relationship_type
+FROM malu$relationship_edge WHERE edge_id = :edge_id;
+ relationship_type 
+-------------------
+ supersedes
+(1 row)
+
+-- ====================================================================
+-- 3. Structure-pass audit row + node insert.
+-- ====================================================================
+SELECT page_index_record_structure_pass(
+    p_tree_id                   => :tree_b,
+    p_parser_kind               => 'pdf',
+    p_parser_version            => 'pypdf-4.0.2',
+    p_outline_node_count        => 3,
+    p_leaf_count                => 2,
+    p_deterministic_inputs_hash => 'deadbeef'
+) AS audit_id \gset
+SELECT parser_kind, parser_version, outline_node_count, leaf_count,
+       outcome, deterministic_inputs_hash
+FROM malu$structure_pass_audit WHERE audit_id = :audit_id;
+ parser_kind | parser_version | outline_node_count | leaf_count | outcome | deterministic_inputs_hash 
+-------------+----------------+--------------------+------------+---------+---------------------------
+ pdf         | pypdf-4.0.2    |                  3 |          2 | ok      | deadbeef
+(1 row)
+
+-- page_index_record_node writes MDO + ledger atomically.
+SELECT mdo_id, derivation_id
+FROM page_index_record_node(
+    p_tree_id     => :tree_b,
+    p_parent_mdo_id => NULL,
+    p_node_kind   => 'internal',
+    p_title       => 'Introduction',
+    p_summary     => 'Intro section summary.',
+    p_anchor_jsonb => '{"page_first": 1, "page_last": 2}'::jsonb)
+\gset root_
+SELECT mdo_kind, node_kind, title, summary
+FROM malu$memory_detail_object WHERE mdo_id = :root_mdo_id;
+    mdo_kind     | node_kind |    title     |        summary         
+-----------------+-----------+--------------+------------------------
+ page_index_node | internal  | Introduction | Intro section summary.
+(1 row)
+
+SELECT derived_object_type
+FROM malu$derivation_ledger WHERE derivation_id = :root_derivation_id;
+ derived_object_type 
+---------------------
+ page_index_node
+(1 row)
+
+-- ====================================================================
+-- 4. Determinism — re-recording the structure pass with the same hash
+--    produces a second row with the same input hash but a new audit_id.
+-- ====================================================================
+SELECT page_index_record_structure_pass(
+    :tree_b, 'pdf', 'pypdf-4.0.2', 3, 2, 'deadbeef'
+) AS audit_id_2 \gset
+SELECT count(DISTINCT deterministic_inputs_hash) AS distinct_hashes,
+       count(*) AS rows_total
+FROM malu$structure_pass_audit
+WHERE tree_id = :tree_b;
+ distinct_hashes | rows_total 
+-----------------+------------
+               1 |          2
+(1 row)
+
+-- ====================================================================
+-- 5. RLS: a different tenant can't promote tenant A's source package.
+-- ====================================================================
+DROP ROLE   IF EXISTS pi2_user_a;
+NOTICE:  role "pi2_user_a" does not exist, skipping
+DROP ROLE   IF EXISTS pi2_user_b;
+NOTICE:  role "pi2_user_b" does not exist, skipping
+DROP SCHEMA IF EXISTS pi2_a CASCADE;
+NOTICE:  schema "pi2_a" does not exist, skipping
+DROP SCHEMA IF EXISTS pi2_b CASCADE;
+NOTICE:  schema "pi2_b" does not exist, skipping
+CREATE ROLE pi2_user_a NOLOGIN;
+CREATE ROLE pi2_user_b NOLOGIN;
+GRANT maludb_memory_executor TO pi2_user_a, pi2_user_b;
+GRANT USAGE ON SCHEMA maludb_core TO pi2_user_a, pi2_user_b;
+CREATE SCHEMA pi2_a AUTHORIZATION pi2_user_a;
+CREATE SCHEMA pi2_b AUTHORIZATION pi2_user_b;
+SET ROLE pi2_user_a;
+SET search_path TO pi2_a, maludb_core, public;
+SELECT register_source_package(
+    p_source_type  => 'document',
+    p_content_text => 'tenant A doc 2',
+    p_media_type   => 'text/plain'
+) AS sp_a \gset
+SET ROLE pi2_user_b;
+SET search_path TO pi2_b, maludb_core, public;
+-- Tenant B sees the source package as not visible. The promotion
+-- call inside page_index_tree_register tries to insert a tree row
+-- whose source_package_id FK points at a row that B's RLS hides
+-- — and the page_index_tree owner_schema would be pi2_b, but the
+-- FK still resolves at the catalog level. The defense here is the
+-- planned register_source_package guard: an FK to a row tenant B
+-- cannot SELECT is still enforced by the FK because the FK check
+-- runs as a SECURITY DEFINER-equivalent path. We assert the row
+-- count after the attempt; either the call fails OR tenant B owns
+-- a tree that points back at A's source package, which would be
+-- a leak. The acceptance check is "no tree row in B owned that
+-- points at A's source_package_id".
+DO $body$
+DECLARE v_count int;
+BEGIN
+    BEGIN
+        PERFORM source_package_promote_to_page_index(
+            (SELECT source_package_id FROM maludb_core.malu$source_package
+              WHERE owner_schema = 'pi2_a' LIMIT 1),
+            'pdf');
+        SELECT count(*) INTO v_count
+          FROM maludb_core.malu$page_index_tree
+         WHERE owner_schema = 'pi2_b';
+        IF v_count > 0 THEN
+            RAISE NOTICE 'cross-tenant promotion produced visible tree row';
+        ELSE
+            RAISE NOTICE 'OK: cross-tenant promotion left no tenant B tree row';
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- RLS hides tenant A's source_package_id from tenant B, so
+        -- the subquery returns NULL and the FK / NOT NULL constraint
+        -- on page_index_tree.source_package_id raises. We don't care
+        -- which error type — any failure here proves isolation held.
+        RAISE NOTICE 'OK: cross-tenant promotion raised %', SQLSTATE;
+    END;
+END $body$;
+NOTICE:  OK: cross-tenant promotion raised 23502
+RESET ROLE;
+RESET search_path;
+SET search_path TO maludb_core, public;
+-- ====================================================================
+-- 6. Atomicity: page_index_record_node — invalid node_kind raises and
+--    nothing lands.
+-- ====================================================================
+SELECT count(*) AS mdo_rows_before
+FROM malu$memory_detail_object
+WHERE tree_id = :tree_b;
+ mdo_rows_before 
+-----------------
+               1
+(1 row)
+
+DO $body$
+BEGIN
+    PERFORM page_index_record_node(
+        p_tree_id     => (SELECT tree_id FROM malu$page_index_tree
+                          WHERE build_status = 'ready'
+                          ORDER BY tree_id DESC LIMIT 1),
+        p_parent_mdo_id => NULL,
+        p_node_kind   => 'BOGUS',
+        p_title       => 'should fail',
+        p_summary     => 'should fail');
+    RAISE EXCEPTION 'should have rejected node_kind=BOGUS';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: page_index_record_node rejects BOGUS node_kind';
+END $body$;
+NOTICE:  OK: page_index_record_node rejects BOGUS node_kind
+-- Row count unchanged.
+SELECT count(*) AS mdo_rows_after
+FROM malu$memory_detail_object
+WHERE tree_id = :tree_b;
+ mdo_rows_after 
+----------------
+              1
+(1 row)
+
+-- ---------- cleanup --------------------------------------------------
+DELETE FROM malu$page_index_tree
+ WHERE owner_schema IN ('pi2_a','pi2_b');
+DELETE FROM malu$source_package
+ WHERE owner_schema IN ('pi2_a','pi2_b');
+DROP SCHEMA pi2_a CASCADE;
+DROP SCHEMA pi2_b CASCADE;
+DROP OWNED BY pi2_user_a;
+DROP OWNED BY pi2_user_b;
+DROP ROLE   pi2_user_a;
+DROP ROLE   pi2_user_b;

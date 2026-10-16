@@ -1,0 +1,125 @@
+-- V3-EMBED-01 — embedding job pipeline regression coverage.
+SET search_path TO maludb_core, public;
+-- ---------------------------------------------------------------------
+-- Setup: register a model alias so the derivation ledger row can FK it.
+-- ---------------------------------------------------------------------
+SELECT register_model_provider('embed_smoke_provider', 'local_runtime', 'echo')
+    AS provider_id \gset p_
+SELECT register_model_alias('embed-smoke-model', 'embed_smoke_provider', 'embed-smoke')
+    AS alias_id \gset m_
+-- ---------------------------------------------------------------------
+-- Test 1: embedding_enqueue creates a job and pushes onto the
+-- 'embed' queue (which is registered on demand).
+-- ---------------------------------------------------------------------
+SELECT embedding_enqueue(
+    'memory_chunk', 42, 'embed-smoke-model', 'space-default',
+    public.digest('hello-embed'::bytea, 'sha256'), '1.0.0') AS job_id \gset e_
+SELECT target_kind, target_id, model_alias, embedding_space, status, queue_job_id IS NOT NULL AS queued
+FROM malu$embedding_job WHERE job_id = :'e_job_id'::bigint;
+ target_kind  | target_id |    model_alias    | embedding_space | status  | queued 
+--------------+-----------+-------------------+-----------------+---------+--------
+ memory_chunk |        42 | embed-smoke-model | space-default   | pending | t
+(1 row)
+
+-- The auto-registered 'embed' queue now exists.
+SELECT name FROM malu$queue WHERE name = 'embed';
+ name  
+-------
+ embed
+(1 row)
+
+-- Re-enqueueing the same (kind, id, alias, space) reuses the queue
+-- job thanks to the idempotency_key passed into queue_enqueue.
+SELECT embedding_enqueue(
+    'memory_chunk', 42, 'embed-smoke-model', 'space-default',
+    public.digest('hello-embed'::bytea, 'sha256'), '1.0.0') AS second_job_id \gset e_
+SELECT count(*) AS embed_job_rows FROM malu$embedding_job
+WHERE target_kind = 'memory_chunk' AND target_id = 42;
+ embed_job_rows 
+----------------
+              2
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 2: embedding_record_output writes the output + derivation
+-- ledger entry. SVPOR frame is required.
+-- ---------------------------------------------------------------------
+DO $body$
+DECLARE v_jid bigint;
+BEGIN
+    SELECT job_id INTO v_jid FROM malu$embedding_job
+     WHERE target_kind = 'memory_chunk' AND target_id = 42
+     ORDER BY job_id LIMIT 1;
+    PERFORM embedding_record_output(v_jid,
+        vector_from_real_array(ARRAY[0.1, 0.2, 0.3]::real[]),
+        3, '', public.digest('out'::bytea, 'sha256'));
+    RAISE EXCEPTION 'embedding_record_output accepted empty SVPOR frame (test 2 fail)';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'embedding_record_output rejects empty SVPOR frame';
+END;
+$body$;
+NOTICE:  embedding_record_output rejects empty SVPOR frame
+SELECT output_id, derivation_id FROM embedding_record_output(
+    :'e_job_id'::bigint,
+    vector_from_real_array(ARRAY[0.1, 0.2, 0.3]::real[]),
+    3,
+    'subject=user verb=asked predicate=question object=hello',
+    public.digest('out'::bytea, 'sha256')) \gset r_
+SELECT vector_dim, length(svpor_frame_text) > 0 AS frame_present,
+       derivation_id IS NOT NULL AS ledger_linked
+FROM malu$embedding_output WHERE output_id = :'r_output_id'::bigint;
+ vector_dim | frame_present | ledger_linked 
+------------+---------------+---------------
+          3 | t             | t
+(1 row)
+
+SELECT derived_object_type, derived_object_id = :'r_output_id'::bigint AS ledger_points_at_output
+FROM malu$derivation_ledger WHERE derivation_id = :'r_derivation_id'::bigint;
+ derived_object_type | ledger_points_at_output 
+---------------------+-------------------------
+ embedding           | t
+(1 row)
+
+-- After record, the job is completed.
+SELECT status FROM malu$embedding_job WHERE job_id = :'e_job_id'::bigint;
+  status   
+-----------
+ completed
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 3: embedding_results returns the just-recorded output.
+-- ---------------------------------------------------------------------
+SELECT output_id = :'r_output_id'::bigint AS matches,
+       embedding_space, vector_dim
+FROM embedding_results('memory_chunk', 42, 'space-default');
+ matches | embedding_space | vector_dim 
+---------+-----------------+------------
+ t       | space-default   |          3
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 4: audit + emit_event coverage.
+-- ---------------------------------------------------------------------
+SELECT event_kind, count(*) AS n FROM malu$audit_event
+WHERE event_kind LIKE 'embedding_%'
+GROUP BY event_kind
+ORDER BY event_kind;
+       event_kind        | n 
+-------------------------+---
+ embedding_enqueue       | 2
+ embedding_record_output | 1
+(2 rows)
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$derivation_ledger WHERE derived_object_id = :'r_output_id'::bigint AND derived_object_type='embedding';
+DELETE FROM malu$embedding_output  WHERE job_id IN (:'e_job_id'::bigint, :'e_second_job_id'::bigint);
+DELETE FROM malu$queue_job         WHERE queue_id IN (SELECT queue_id FROM malu$queue WHERE name='embed');
+DELETE FROM malu$embedding_job     WHERE job_id IN (:'e_job_id'::bigint, :'e_second_job_id'::bigint);
+DELETE FROM malu$queue             WHERE name = 'embed';
+DELETE FROM malu$audit_event       WHERE event_kind LIKE 'embedding_%' OR event_kind LIKE 'queue_%';
+DELETE FROM malu$event             WHERE event_kind = 'queue_enqueue';
+DELETE FROM malu$model_alias       WHERE alias_id = :'m_alias_id'::bigint;
+DELETE FROM malu$model_provider    WHERE provider_id = :'p_provider_id'::bigint;

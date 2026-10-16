@@ -1,0 +1,79 @@
+\set ECHO none
+enable_a
+194
+(1 row)
+enable_b
+194
+(1 row)
+subject_type|category|curated
+skill|entity|t
+(1 row)
+register_v1
+{"tags": {"verbs": 2, "keywords": 3, "subjects": 2}, "reused": false, "version": "4a46a5471d01", "skill_name": "pdf-processing", "files_linked": 2}
+(1 row)
+skill_name|version|enabled|files
+pdf-processing|4a46a5471d01|t|2
+(1 row)
+license
+Apache-2.0
+(1 row)
+tag_provenance
+extracted
+(1 row)
+repush
+{"reused": true, "skill_name": "pdf-processing"}
+(1 row)
+register_v2
+{"tags": {"verbs": 0, "keywords": 0, "subjects": 0}, "reused": false, "version": "605bdce02bf0", "skill_name": "pdf-processing", "superseded": true, "files_linked": 0}
+(1 row)
+version|enabled
+4a46a5471d01|f
+605bdce02bf0|t
+(2 rows)
+register_v3
+{"tags": {"verbs": 2, "keywords": 0, "subjects": 0}, "reused": false, "version": "a512f850b1c6", "skill_name": "pdf-processing", "superseded": false, "files_linked": 0}
+(1 row)
+visible_versions
+2
+(1 row)
+version|parent_version
+4a46a5471d01|none
+605bdce02bf0|4a46a5471d01
+a512f850b1c6|605bdce02bf0
+(3 rows)
+immutability_guard
+fired
+(1 row)
+lifecycle_update_ok
+1
+(1 row)
+verb_hits_superseded_only
+0
+(1 row)
+skill_name|version|reasons
+pdf-processing|a512f850b1c6|verb
+(1 row)
+superseded_hidden
+t
+(1 row)
+ingest_created
+{"edges": 1, "verbs": 1, "episodes": 0, "subjects": 1, "relationships": 0, "edge_attributes": 0, "node_attributes": 0}
+(1 row)
+register_csv_files
+2
+(1 row)
+payload_files|payload_hash_set|payload_executables
+2|t|1
+(1 row)
+forked
+t
+(1 row)
+fork_markdown_copied|fork_hash_copied|fork_files|fork_lineage_schema
+t|t|2|asd_a
+(1 row)
+fork_packages
+2
+(1 row)
+fork_immutability_guard
+fired
+(1 row)

@@ -1,0 +1,30 @@
+-- V3-OBS-01 — metric definitions + Prometheus scrape regression coverage.
+
+SET search_path TO maludb_core, public;
+
+-- ---------------------------------------------------------------------
+-- Test 1: catalog is seeded with the expected metric family count.
+-- ---------------------------------------------------------------------
+SELECT count(*) > 10 AS seeded_at_least_a_dozen
+FROM malu$metric_definition WHERE retired_at IS NULL;
+
+-- A handful of the core families must be present.
+SELECT name FROM malu$metric_definition
+WHERE name IN ('maludb_extension_version', 'maludb_audit_event_total',
+               'maludb_queue_depth', 'maludb_rest_invocation_total',
+               'maludb_event_total', 'maludb_embedding_job_total')
+ORDER BY name;
+
+-- ---------------------------------------------------------------------
+-- Test 2: metrics_prometheus_scrape returns text containing the
+-- expected family names + the HELP/TYPE preambles.
+-- ---------------------------------------------------------------------
+SELECT length(metrics_prometheus_scrape()) > 200 AS has_body;
+
+SELECT position('# HELP maludb_extension_version' IN metrics_prometheus_scrape()) > 0 AS help_present,
+       position('# TYPE maludb_audit_event_total counter' IN metrics_prometheus_scrape()) > 0 AS type_present,
+       position('maludb_extension_version{version="' || maludb_core_version() || '"} 1' IN metrics_prometheus_scrape()) > 0 AS version_value_present;
+
+-- ---------------------------------------------------------------------
+-- Cleanup. (Nothing to clean; the catalog rows are extension-managed.)
+-- ---------------------------------------------------------------------

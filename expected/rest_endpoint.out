@@ -1,0 +1,257 @@
+-- V3-API-01 (catalog) — REST endpoint catalog + invocation audit
+-- regression coverage. Tests run as the regression superuser
+-- (BYPASSRLS) for seeding; SET ROLE into a memory_executor-bearing
+-- login role exercises the public APIs under RLS.
+SET search_path TO maludb_core, public;
+-- ---------------------------------------------------------------------
+-- Setup. One non-superuser PG role for the catalog operations and
+-- one for the dispatcher side (mirroring how operators wire
+-- maludb-restd in production).
+-- ---------------------------------------------------------------------
+DO $body$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rest_test_user') THEN
+        CREATE ROLE rest_test_user LOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rest_dispatch_user') THEN
+        CREATE ROLE rest_dispatch_user LOGIN;
+    END IF;
+END;
+$body$;
+GRANT maludb_memory_executor    TO rest_test_user;
+GRANT maludb_rest_dispatcher    TO rest_dispatch_user;
+-- ---------------------------------------------------------------------
+-- Test 1: register an endpoint via the public helper. handler_function
+-- targets maludb_core_version() — a stable, always-present function.
+-- ---------------------------------------------------------------------
+SELECT rest_register_endpoint(
+    'GET',
+    '/version',
+    'maludb_core.maludb_core_version()'::regprocedure,
+    'Returns the extension version string.',
+    ARRAY[]::text[],
+    'read_only',
+    jsonb_build_object(
+        'summary', 'Get extension version',
+        'responses', jsonb_build_object(
+            '200', jsonb_build_object('description','OK'))))
+    AS endpoint_id \gset reg_
+SELECT :'reg_endpoint_id'::bigint > 0 AS endpoint_id_assigned;
+ endpoint_id_assigned 
+----------------------
+ t
+(1 row)
+
+-- Verify the row landed with the expected handler.
+SELECT method, path, handler_function::text AS handler, risk_class, enabled
+FROM malu$rest_endpoint
+WHERE endpoint_id = :'reg_endpoint_id'::bigint;
+ method |   path   |        handler        | risk_class | enabled 
+--------+----------+-----------------------+------------+---------
+ GET    | /version | maludb_core_version() | read_only  | t
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 2: re-register the same (method, path) — UPSERT updates the
+-- row, retains endpoint_id, refreshes the description. The openapi_spec
+-- is preserved (re-passed) so Test 4 can assert the per-endpoint
+-- fragment merged correctly.
+-- ---------------------------------------------------------------------
+SELECT rest_register_endpoint(
+    'GET',
+    '/version',
+    'maludb_core.maludb_core_version()'::regprocedure,
+    'Updated description for /version.',
+    ARRAY[]::text[],
+    'read_only',
+    jsonb_build_object(
+        'summary', 'Get extension version',
+        'responses', jsonb_build_object(
+            '200', jsonb_build_object('description','OK'))))
+    = :'reg_endpoint_id'::bigint AS upsert_same_id;
+ upsert_same_id 
+----------------
+ t
+(1 row)
+
+SELECT description
+FROM malu$rest_endpoint
+WHERE endpoint_id = :'reg_endpoint_id'::bigint;
+            description            
+-----------------------------------
+ Updated description for /version.
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 3: rest_list_endpoints returns the catalog. memory_executor is
+-- granted EXECUTE so a tenant role can enumerate.
+-- ---------------------------------------------------------------------
+SET ROLE rest_test_user;
+SET search_path TO maludb_core, public;
+SELECT method, path, risk_class, enabled
+FROM rest_list_endpoints()
+WHERE path = '/version';
+ method |   path   | risk_class | enabled 
+--------+----------+------------+---------
+ GET    | /version | read_only  | t
+(1 row)
+
+RESET ROLE;
+-- ---------------------------------------------------------------------
+-- Test 4: rest_openapi_spec assembles the catalog into an OpenAPI 3.1
+-- document. Validate top-level fields and that /version is present.
+-- ---------------------------------------------------------------------
+SELECT rest_openapi_spec() ->> 'openapi'           AS openapi_version,
+       rest_openapi_spec() #>> '{info,title}'      AS info_title,
+       rest_openapi_spec() #> '{paths,/version}' IS NOT NULL AS version_path_present;
+ openapi_version |   info_title    | version_path_present 
+-----------------+-----------------+----------------------
+ 3.1.0           | MaluDB REST API | t
+(1 row)
+
+-- The /version path's `get` should be present too (merged from the
+-- per-endpoint openapi_spec jsonb).
+SELECT rest_openapi_spec() #>> '{paths,/version,get,summary}' AS version_get_summary;
+  version_get_summary  
+-----------------------
+ Get extension version
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 5: rest_disable_endpoint soft-disables; rest_list_endpoints
+-- default filters it out; passing true includes it.
+-- ---------------------------------------------------------------------
+SELECT rest_disable_endpoint('GET', '/version', 'test 5 disable')
+    AS disable_was_active;
+ disable_was_active 
+--------------------
+ t
+(1 row)
+
+SELECT count(*) AS active_after_disable
+FROM rest_list_endpoints()
+WHERE path = '/version';
+ active_after_disable 
+----------------------
+                    0
+(1 row)
+
+SELECT count(*) AS all_after_disable
+FROM rest_list_endpoints(true)
+WHERE path = '/version';
+ all_after_disable 
+-------------------
+                 1
+(1 row)
+
+-- Re-registering should clear retired_at and re-enable.
+SELECT rest_register_endpoint(
+    'GET',
+    '/version',
+    'maludb_core.maludb_core_version()'::regprocedure,
+    'Re-enabled /version.',
+    ARRAY[]::text[],
+    'read_only',
+    '{}'::jsonb)
+    = :'reg_endpoint_id'::bigint AS reenable_same_id;
+ reenable_same_id 
+------------------
+ t
+(1 row)
+
+SELECT enabled, retired_at IS NULL AS retired_at_cleared
+FROM malu$rest_endpoint
+WHERE endpoint_id = :'reg_endpoint_id'::bigint;
+ enabled | retired_at_cleared 
+---------+--------------------
+ t       | t
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 6: rest_log_invocation writes a malu$rest_invocation row when
+-- called by the rest dispatcher role. The row carries the audit
+-- fields the future maludb-restd will populate per request.
+-- ---------------------------------------------------------------------
+SET ROLE rest_dispatch_user;
+SET search_path TO maludb_core, public;
+SELECT rest_log_invocation(
+    :'reg_endpoint_id'::bigint,
+    NULL,                                              -- account_id
+    NULL,                                              -- token_id
+    'GET',
+    '/version',
+    'rest_dispatch_user',
+    '127.0.0.1'::inet,
+    public.digest('GET /version'::bytea, 'sha256'),
+    public.digest('"0.44.0"'::bytea, 'sha256'),
+    200::smallint,
+    7,
+    now() - interval '7 ms',
+    now(),
+    true,
+    NULL, NULL)
+    IS NOT NULL AS invocation_id_assigned;
+ invocation_id_assigned 
+------------------------
+ t
+(1 row)
+
+RESET ROLE;
+SELECT method, path, status_code, success
+FROM malu$rest_invocation
+WHERE endpoint_id = :'reg_endpoint_id'::bigint
+ORDER BY started_at DESC
+LIMIT 1;
+ method |   path   | status_code | success 
+--------+----------+-------------+---------
+ GET    | /version |         200 | t
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 7: a role lacking maludb_rest_dispatcher cannot insert audit
+-- rows via rest_log_invocation.
+-- ---------------------------------------------------------------------
+SET ROLE rest_test_user;
+SET search_path TO maludb_core, public;
+DO $body$
+BEGIN
+    PERFORM rest_log_invocation(
+        NULL::bigint, NULL::bigint, NULL::bigint,
+        'GET', '/version', NULL, NULL,
+        NULL::bytea, NULL::bytea,
+        200::smallint, 1, now(), now(), true, NULL, NULL);
+    RAISE EXCEPTION 'non-dispatcher was allowed to log_invocation (test 7 fail)';
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'non-dispatcher correctly denied rest_log_invocation';
+END;
+$body$;
+NOTICE:  non-dispatcher correctly denied rest_log_invocation
+RESET ROLE;
+-- ---------------------------------------------------------------------
+-- Test 8: audit_event coverage.
+-- ---------------------------------------------------------------------
+SELECT event_kind, count(*) AS n
+FROM malu$audit_event
+WHERE event_kind LIKE 'rest_endpoint_%'
+  AND (event_jsonb ->> 'path') = '/version'
+GROUP BY event_kind
+ORDER BY event_kind;
+       event_kind       | n 
+------------------------+---
+ rest_endpoint_disable  | 1
+ rest_endpoint_register | 1
+ rest_endpoint_update   | 2
+(3 rows)
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$rest_invocation
+WHERE endpoint_id = :'reg_endpoint_id'::bigint;
+DELETE FROM malu$rest_endpoint
+WHERE endpoint_id = :'reg_endpoint_id'::bigint;
+DELETE FROM malu$audit_event WHERE event_kind LIKE 'rest_endpoint_%';
+REVOKE maludb_memory_executor FROM rest_test_user;
+REVOKE maludb_rest_dispatcher FROM rest_dispatch_user;
+DROP ROLE rest_test_user;
+DROP ROLE rest_dispatch_user;

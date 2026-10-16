@@ -1,0 +1,5 @@
+usr/lib/postgresql/18/lib/maludb_core.so
+usr/share/postgresql/18/extension/maludb_core.control
+usr/share/postgresql/18/extension/maludb_core--*.sql
+usr/lib/postgresql/18/lib/bitcode/maludb_core.index.bc
+usr/lib/postgresql/18/lib/bitcode/maludb_core/src/*.bc

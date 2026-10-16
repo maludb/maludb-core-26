@@ -1,0 +1,20 @@
+#!/bin/sh
+# Postinst for postgresql-17-maludb-core.
+#
+# We do NOT auto-CREATE EXTENSION here. The DBA owns when extensions
+# enter a database. Print a one-liner pointing at the right command.
+
+set -e
+
+case "$1" in
+    configure)
+        echo "MaluDB core extension files installed for PostgreSQL 17."
+        echo "To enable in a database:"
+        echo "    sudo -u postgres psql -d <db> -c 'CREATE EXTENSION maludb_core CASCADE;'"
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

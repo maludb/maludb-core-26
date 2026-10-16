@@ -1,0 +1,107 @@
+Source: maludb
+Section: database
+Priority: optional
+Maintainer: Edward Honour <ed@maludb.org>
+Build-Depends: debhelper-compat (= 13),
+               postgresql-server-dev-all (>= 217~),
+               postgresql-server-dev-16,
+               postgresql-server-dev-17,
+               postgresql-server-dev-18,
+               libpq-dev,
+               libmicrohttpd-dev,
+               libjansson-dev,
+               libgnutls28-dev,
+               libcurl4-openssl-dev,
+               pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/maludb/maludb-core
+Vcs-Git: https://github.com/maludb/maludb-core.git
+Vcs-Browser: https://github.com/maludb/maludb-core
+Rules-Requires-Root: no
+
+Package: postgresql-16-maludb-core
+Architecture: any
+Pre-Depends: postgresql-16
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         postgresql-16,
+         postgresql-16-pgvector,
+         postgresql-16-pgaudit,
+         postgresql-16-partman
+Description: MaluDB memory core — PostgreSQL 16 extension
+ PostgreSQL 16 build of the maludb_core extension. See the
+ postgresql-17-maludb-core package for the full feature description.
+
+Package: postgresql-17-maludb-core
+Architecture: any
+Pre-Depends: postgresql-17
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         postgresql-17,
+         postgresql-17-pgvector,
+         postgresql-17-pgaudit,
+         postgresql-17-partman
+Description: MaluDB memory core — PostgreSQL 17 extension
+ MaluDB is a memory DBMS for long-term institutional memory, human-AI
+ knowledge sharing, and contextual recall. This package provides the
+ maludb_core extension (migration chain through 0.95.0):
+ .
+  * Stage 1 schema + MC2DB tool registry with four implementation_type
+    dispatchers.
+  * Stage 2 memory object model: source packages, claims, facts,
+    episode objects, memory detail objects, relationship edges,
+    derivation ledger.
+  * Stage 3 bitemporal time, SVPOR organization, MAUT confidence
+    scoring, lifecycle + supersession engine, legal hold.
+  * Stage 4 retrieval planner with FTS + pg_trgm + graph traversal +
+    query hints + authorization-aware retrieval (planning, expansion,
+    assembly).
+  * Stage 5 workflow extraction engine, skill runtime, active
+    memory pools, episode replay API.
+  * Stage 6 local-node sync protocol, model registry with blue-green
+    indexes + dual-space routing + adapter alignment + local-model
+    capability negotiation, and an advanced MC2DB tool surface.
+  * V3 platform (Stages 8-15): auth/secret store, REST endpoint
+    registry, durable queue, cron scheduler, verbatim source archive,
+    realtime events + presence, metrics/log-drain/backup manifests.
+  * V4 (Stages 16+): PageIndex / ChatIndex tree-of-summaries catalogs
+    with LLM-guided descent over the source archive.
+  * Memory graph (0.75.0-0.95.0): typed subjects/verbs, SVO statement
+    edges, polymorphic attributes + templates, episodes as typed event
+    subjects, one-call JSON extraction ingest, and the semantic spine -
+    entity-card embeddings with a trigger-fed dirty queue and opt-in
+    similarity jumps in graph traversal.
+
+Package: postgresql-18-maludb-core
+Architecture: any
+Pre-Depends: postgresql-18
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         postgresql-18,
+         postgresql-18-pgvector,
+         postgresql-18-pgaudit,
+         postgresql-18-partman
+Description: MaluDB memory core — PostgreSQL 18 extension
+ PostgreSQL 18 build of the maludb_core extension. See the
+ postgresql-17-maludb-core package for the full feature description.
+
+Package: maludb-mc2dbd
+Architecture: any
+Pre-Depends: adduser
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         postgresql-17-maludb-core (>= ${source:Version})
+Recommends: ca-certificates
+Description: MaluDB MC2DB listener (MCP-over-HTTPS sidecar)
+ The maludb_mc2dbd daemon exposes the MaluDB MC2DB tool registry as
+ an MCP-compatible HTTPS endpoint, plus a Prometheus /metrics scrape
+ endpoint. Four implementation_type dispatchers are wired:
+ sql_function (libpq into the PG session), external_exec (fork+exec
+ with per-tool timeout and absolute-path-only enforcement), mcp_proxy
+ (forwards tools/call to a remote MCP server over HTTP or stdio
+ transport), and http_endpoint (generic REST call dispatcher).
+ .
+ Installs a hardened systemd unit (ProtectSystem=strict,
+ ProtectHome=read-only, RestrictAddressFamilies). Listens on
+ 127.0.0.1:5329 by default; bind/cert/token configured under
+ /etc/maludb/maludb-mc2dbd.conf.

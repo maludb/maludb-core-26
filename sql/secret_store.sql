@@ -1,0 +1,177 @@
+-- V3-SECRET-01 — governed secret store regression coverage.
+--
+-- Exercises: secret_set (inline) / secret_set_external / secret_revoke
+-- / secret_get_metadata / __secret_resolve (accept and reject paths) /
+-- audit / RLS. Tests run as the regression superuser (BYPASSRLS) for
+-- seeding, then SET ROLE into a non-superuser role granted
+-- maludb_secret_consumer to exercise __secret_resolve.
+
+SET search_path TO maludb_core, public;
+
+-- ---------------------------------------------------------------------
+-- Setup. One non-superuser PG role granted both
+-- maludb_memory_executor (for catalog writes) and maludb_secret_consumer
+-- (for __secret_resolve EXECUTE).
+-- ---------------------------------------------------------------------
+DO $body$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'secret_test_user') THEN
+        CREATE ROLE secret_test_user LOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'secret_nonconsumer_user') THEN
+        CREATE ROLE secret_nonconsumer_user LOGIN;
+    END IF;
+END;
+$body$;
+GRANT maludb_memory_executor   TO secret_test_user, secret_nonconsumer_user;
+GRANT maludb_secret_consumer   TO secret_test_user;
+
+-- ---------------------------------------------------------------------
+-- Test 1: secret_set creates a new secret with version 1, inline mode.
+-- ---------------------------------------------------------------------
+SELECT *
+FROM secret_set('openai_key', 'provider', 'sk-test-aaaaaaaaaaaaaaaaaaaa') \gset s1_
+
+SELECT :'s1_secret_id'::bigint > 0  AS secret_id_assigned,
+       :'s1_version'::int = 1       AS first_version;
+
+-- secret_get_metadata reflects the inline value with current_version=1.
+SELECT name, kind, current_version, mode, retired_at IS NULL AS active
+FROM secret_get_metadata('openai_key');
+
+-- ---------------------------------------------------------------------
+-- Test 2: __secret_resolve returns plaintext when called by a
+-- maludb_secret_consumer-bearing role under RLS.
+-- ---------------------------------------------------------------------
+SET ROLE secret_test_user;
+SELECT __secret_resolve('openai_key') = 'sk-test-aaaaaaaaaaaaaaaaaaaa' AS roundtrip_ok;
+RESET ROLE;
+
+-- The use row should now exist with outcome='resolved'.
+SELECT outcome
+FROM malu$secret_use
+ORDER BY used_at DESC LIMIT 1;
+
+-- ---------------------------------------------------------------------
+-- Test 3: rotation. secret_set with the same name retires the prior
+-- version and creates version 2; __secret_resolve returns the new value.
+-- ---------------------------------------------------------------------
+SELECT *
+FROM secret_set('openai_key', 'provider', 'sk-test-bbbbbbbbbbbbbbbbbbbb') \gset s2_
+
+SELECT :'s2_version'::int = 2 AS rotated_to_v2;
+
+SELECT name, current_version, mode FROM secret_get_metadata('openai_key');
+
+-- Version 1 should be retired; only version 2 active.
+SELECT version, retired_at IS NULL AS active
+FROM malu$secret_version
+WHERE secret_id = :'s1_secret_id'::bigint
+ORDER BY version;
+
+SET ROLE secret_test_user;
+SELECT __secret_resolve('openai_key') = 'sk-test-bbbbbbbbbbbbbbbbbbbb' AS rotated_resolves;
+RESET ROLE;
+
+-- ---------------------------------------------------------------------
+-- Test 4: non-consumer role cannot resolve. secret_nonconsumer_user
+-- has memory_executor but not secret_consumer → permission denied on
+-- __secret_resolve EXECUTE.
+-- ---------------------------------------------------------------------
+SET ROLE secret_nonconsumer_user;
+DO $body$
+BEGIN
+    PERFORM __secret_resolve('openai_key');
+    RAISE EXCEPTION 'non-consumer was allowed to resolve secret (test 4 fail)';
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'non-consumer correctly denied __secret_resolve';
+END;
+$body$;
+RESET ROLE;
+
+-- ---------------------------------------------------------------------
+-- Test 5: external_ref dispatch via the C resolver (V3-SECRET-02).
+-- The catalog accepts any external_ref; __secret_resolve hands the
+-- ref to the C resolver, which rejects unsupported schemes with
+-- feature_not_supported. file:// + https:// happy paths live in the
+-- TAP suite where filesystem mode/owner can be controlled.
+-- ---------------------------------------------------------------------
+SELECT *
+FROM secret_set_external('proxy_token', 'broker',
+                         's3://maludb-secrets/proxy.token') \gset s3_
+
+SELECT name, mode FROM secret_get_metadata('proxy_token');
+
+SET ROLE secret_test_user;
+DO $body$
+BEGIN
+    PERFORM __secret_resolve('proxy_token');
+    RAISE EXCEPTION 'external secret resolved unexpectedly (test 5 fail)';
+EXCEPTION WHEN feature_not_supported THEN
+    RAISE NOTICE 'external secret correctly raised feature_not_supported';
+END;
+$body$;
+RESET ROLE;
+
+-- ---------------------------------------------------------------------
+-- Test 6: revocation. After secret_revoke, secret_get_metadata shows
+-- retired_at; __secret_resolve raises object_not_in_prerequisite_state.
+-- ---------------------------------------------------------------------
+SELECT secret_revoke('openai_key', 'test 6 revoke') AS revoked_was_active;
+
+SELECT retired_at IS NOT NULL AS retired
+FROM secret_get_metadata('openai_key');
+
+SET ROLE secret_test_user;
+DO $body$
+BEGIN
+    PERFORM __secret_resolve('openai_key');
+    RAISE EXCEPTION 'retired secret resolved unexpectedly (test 6 fail)';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'retired secret correctly rejected';
+END;
+$body$;
+RESET ROLE;
+
+-- ---------------------------------------------------------------------
+-- Test 7: value_encrypted column is encrypted bytea, not plaintext.
+-- Any inspection by a tenant returns ciphertext of length > 0 that
+-- starts with the pgp_sym_encrypt marker.
+-- ---------------------------------------------------------------------
+SELECT octet_length(value_encrypted) > 0     AS ciphertext_nonempty,
+       value_encrypted::text NOT LIKE '%sk-test-%' AS plaintext_not_visible
+FROM malu$secret_version
+WHERE secret_id = :'s1_secret_id'::bigint
+  AND version  = 2;
+
+-- ---------------------------------------------------------------------
+-- Test 8: audit_event coverage. Counts across create / rotate /
+-- revoke / resolve_accept / resolve_reject.
+-- ---------------------------------------------------------------------
+SELECT event_kind, count(*) AS n
+FROM malu$audit_event
+WHERE event_kind LIKE 'secret_%'
+GROUP BY event_kind
+ORDER BY event_kind;
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$secret_use
+WHERE secret_version_id IN (
+    SELECT secret_version_id FROM malu$secret_version
+    WHERE secret_id IN (:'s1_secret_id'::bigint, :'s3_secret_id'::bigint)
+);
+
+DELETE FROM malu$secret_version
+WHERE secret_id IN (:'s1_secret_id'::bigint, :'s3_secret_id'::bigint);
+
+DELETE FROM malu$secret
+WHERE secret_id IN (:'s1_secret_id'::bigint, :'s3_secret_id'::bigint);
+
+DELETE FROM malu$audit_event WHERE event_kind LIKE 'secret_%';
+
+REVOKE maludb_memory_executor FROM secret_test_user, secret_nonconsumer_user;
+REVOKE maludb_secret_consumer FROM secret_test_user;
+DROP ROLE secret_test_user;
+DROP ROLE secret_nonconsumer_user;

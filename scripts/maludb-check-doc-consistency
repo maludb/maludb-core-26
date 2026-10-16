@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# maludb-check-doc-consistency — Stage 8 (V3-DOC-01) + Stage 16 (V4-DOC-01)
+# acceptance check.
+#
+# Fails if maludb_core.control, README.md, and docs/user-manual.md
+# disagree on the extension default_version or supported PostgreSQL
+# majors. Intended for CI and pre-tag verification.
+#
+# V4 extension: when the README/CHANGELOG/manual carry a v4.x tag, the
+# script also asserts that the V4 plan document is present and that the
+# README mentions Version 4 / PageIndex so a reader cannot miss the
+# track that owns the current migration.
+#
+# Usage:
+#   scripts/maludb-check-doc-consistency           # check
+#   scripts/maludb-check-doc-consistency --print   # print findings without failing
+#
+# Exit codes:
+#   0  consistent
+#   1  inconsistent or required file missing
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+control="$repo_root/maludb_core.control"
+readme="$repo_root/README.md"
+manual="$repo_root/docs/user-manual.md"
+changelog="$repo_root/CHANGELOG.md"
+
+print_only=0
+if [[ "${1:-}" == "--print" ]]; then
+    print_only=1
+fi
+
+fail=0
+issues=()
+
+require_file() {
+    if [[ ! -f "$1" ]]; then
+        issues+=("missing required file: $1")
+        fail=1
+    fi
+}
+
+require_file "$control"
+require_file "$readme"
+require_file "$manual"
+require_file "$changelog"
+
+if (( fail )); then
+    printf '%s\n' "${issues[@]}" >&2
+    exit 1
+fi
+
+# --- default_version ---
+control_version="$(grep -E "^default_version" "$control" | head -1 \
+    | sed -E "s/.*=\s*'([^']+)'.*/\1/")"
+if [[ -z "$control_version" ]]; then
+    issues+=("could not parse default_version from $control")
+    fail=1
+fi
+
+# README "Version | **0.41.0** (extension) — tagged `vX`"
+readme_version="$(grep -E "^\|\s*Version\s*\|" "$readme" | head -1 \
+    | sed -E 's/.*\*\*([0-9]+\.[0-9]+\.[0-9]+)\*\*.*/\1/')"
+if [[ -z "$readme_version" || "$readme_version" == *"|"* ]]; then
+    issues+=("could not parse extension version from $readme Status table")
+    fail=1
+fi
+
+# Manual "Extension `default_version` | **0.41.0** (...)"
+manual_version="$(grep -E "Extension \`default_version\`" "$manual" | head -1 \
+    | sed -E 's/.*\*\*([0-9]+\.[0-9]+\.[0-9]+)\*\*.*/\1/')"
+if [[ -z "$manual_version" || "$manual_version" == *"|"* ]]; then
+    issues+=("could not parse extension version from $manual §1.1 Current Version block")
+    fail=1
+fi
+
+if [[ -n "$control_version" && -n "$readme_version" && "$control_version" != "$readme_version" ]]; then
+    issues+=("default_version mismatch: control=$control_version README=$readme_version")
+    fail=1
+fi
+if [[ -n "$control_version" && -n "$manual_version" && "$control_version" != "$manual_version" ]]; then
+    issues+=("default_version mismatch: control=$control_version user-manual=$manual_version")
+    fail=1
+fi
+
+# --- release tag (README Status table vs CHANGELOG top entry) ---
+readme_tag="$(grep -E "^\|\s*Version\s*\|" "$readme" | head -1 \
+    | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?' | head -1)"
+changelog_tag="$(grep -E "^## v[0-9]+" "$changelog" | head -1 \
+    | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?')"
+manual_tag="$(grep -iE "release tag\s*\|" "$manual" | head -1 \
+    | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?' | head -1)"
+
+if [[ -z "$readme_tag" || -z "$changelog_tag" || -z "$manual_tag" ]]; then
+    issues+=("could not parse release tag from one of: README ($readme_tag), CHANGELOG ($changelog_tag), user-manual ($manual_tag)")
+    fail=1
+fi
+if [[ -n "$readme_tag" && -n "$changelog_tag" && "$readme_tag" != "$changelog_tag" ]]; then
+    issues+=("release tag mismatch: README=$readme_tag CHANGELOG=$changelog_tag")
+    fail=1
+fi
+if [[ -n "$manual_tag" && -n "$readme_tag" && "$manual_tag" != "$readme_tag" ]]; then
+    issues+=("release tag mismatch: user-manual=$manual_tag README=$readme_tag")
+    fail=1
+fi
+
+# --- supported PostgreSQL majors ---
+# Manual: "Supported PostgreSQL majors | 16, 17, 18 (...)" — pick the list
+# portion of the table cell (up to the parenthetical), then extract versions
+# in document order so a "PG 17 is blocking" aside is not re-counted.
+manual_pg_cell="$(grep -E "Supported PostgreSQL majors" "$manual" | head -1 \
+    | sed -E 's/.*\| Supported PostgreSQL majors \| ([^()|]+).*/\1/')"
+manual_pg="$(printf '%s' "$manual_pg_cell" | grep -oE '1[6-9]' | paste -sd, -)"
+# CI workflow: matrix.pg: ['16', '17', '18']
+ci="$repo_root/.github/workflows/ci.yml"
+ci_pg=""
+if [[ -f "$ci" ]]; then
+    ci_pg="$(grep -oE "pg:\s*\[[^]]+\]" "$ci" | head -1 \
+        | grep -oE "'[0-9]+'" | tr -d "'" | paste -sd, -)"
+fi
+if [[ -n "$manual_pg" && -n "$ci_pg" ]]; then
+    manual_norm="$(echo "$manual_pg" | tr -d ' ')"
+    if [[ "$manual_norm" != "$ci_pg" ]]; then
+        issues+=("supported PG majors mismatch: user-manual=$manual_norm ci=$ci_pg")
+        fail=1
+    fi
+fi
+
+# --- shipped services list sanity ---
+# Each service has a canonical name and an accepted shorthand. README and the
+# user-manual must mention either form for each.
+check_service() {
+    local label="$1"; local file="$2"; shift 2
+    for alias in "$@"; do
+        if grep -qE "$alias" "$file"; then
+            return 0
+        fi
+    done
+    issues+=("$label does not mention shipped service: $1 (also acceptable: $*)")
+    fail=1
+}
+check_service "user-manual" "$manual" "maludb_modeld"  "modeld"
+check_service "user-manual" "$manual" "maludb_mc2dbd"  "mc2dbd"
+check_service "user-manual" "$manual" "mcp-broker"
+check_service "user-manual" "$manual" "maludb-restd"      "restd"
+check_service "user-manual" "$manual" "maludb-realtimed"  "realtimed"
+check_service "README"      "$readme" "maludb_modeld"     "modeld"
+check_service "README"      "$readme" "maludb_mc2dbd"     "mc2dbd"
+check_service "README"      "$readme" "mcp-broker"
+check_service "README"      "$readme" "maludb-restd"      "restd"
+check_service "README"      "$readme" "maludb-realtimed"  "realtimed"
+
+# --- shipped SDK list sanity ---
+# C SDK is referenced as "C (`libmaludb` ...)" in the manual; accept either form.
+check_sdk() {
+    local label="$1"; local file="$2"; shift 2
+    for alias in "$@"; do
+        if grep -qF "$alias" "$file"; then
+            return 0
+        fi
+    done
+    issues+=("$label does not mention shipped SDK: $1 (also acceptable: $*)")
+    fail=1
+}
+check_sdk "user-manual" "$manual" "C SDK" "libmaludb"
+check_sdk "user-manual" "$manual" "Python"
+check_sdk "user-manual" "$manual" "Node.js"
+check_sdk "user-manual" "$manual" "PHP"
+
+# --- Stage 7 closed claim must appear in README ---
+if ! grep -qE "Stage 1.7|Stage 7.*shipped|public alpha" "$readme"; then
+    issues+=("README does not document Stage 7 / public-alpha state")
+    fail=1
+fi
+
+# --- V4 awareness: only checked once a v4.x tag is the current release ---
+if [[ "$readme_tag" =~ ^v4\. ]]; then
+    v4_plan="$repo_root/version4-pageindex-plan.md"
+    if [[ ! -f "$v4_plan" ]]; then
+        issues+=("v4 tag in README but version4-pageindex-plan.md is missing")
+        fail=1
+    fi
+    if ! grep -qE "Version 4|V4|PageIndex" "$readme"; then
+        issues+=("README does not document Version 4 / PageIndex state")
+        fail=1
+    fi
+fi
+
+# --- Output ---
+if (( fail )); then
+    printf 'maludb-check-doc-consistency: %d issue(s):\n' "${#issues[@]}" >&2
+    printf '  - %s\n' "${issues[@]}" >&2
+    if (( print_only )); then
+        exit 0
+    fi
+    exit 1
+fi
+
+cat <<EOF
+maludb-check-doc-consistency: OK
+  default_version = $control_version (control, README, user-manual all agree)
+  release tag     = $readme_tag (README, CHANGELOG, user-manual all agree)
+  PG majors       = ${manual_pg:-?} (manual) / ${ci_pg:-?} (CI)
+  services        = maludb_modeld, maludb_mc2dbd, mcp-broker
+  SDKs            = C, Python, Node.js, PHP
+EOF

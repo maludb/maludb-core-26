@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maludb-logsd"
+version = "0.1.0"
+description = "MaluDB log-drain forwarder — pulls catalog-resident streams (audit, realtime_event) and ships to configured drains."
+readme = "README.md"
+license = { text = "PostgreSQL" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Edward Honour", email = "ed@maludb.org" }
+]
+keywords = ["maludb", "logs", "drains", "postgres", "audit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: PostgreSQL License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: System :: Logging",
+]
+
+dependencies = [
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+]
+
+[project.scripts]
+maludb-logsd = "maludb_logsd.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maludb_logsd"]

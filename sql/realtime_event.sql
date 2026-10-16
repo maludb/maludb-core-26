@@ -1,0 +1,90 @@
+-- V3-REALTIME-01 — event catalog + emit/subscribe/ack regression coverage.
+
+SET search_path TO maludb_core, public;
+
+-- ---------------------------------------------------------------------
+-- Test 1: emit + subscribe + fetch round-trip.
+-- ---------------------------------------------------------------------
+SELECT emit_event('test_event_a', '{"task":"a"}'::jsonb) AS evt_a \gset e_
+SELECT emit_event('test_event_b', '{"task":"b"}'::jsonb) AS evt_b \gset e_
+SELECT emit_event('test_event_c', '{"task":"c"}'::jsonb,
+                  NULL, NULL, NULL, NULL, NULL, NULL) AS evt_c \gset e_
+
+SELECT :'e_evt_a'::bigint > 0 AS evt_a_assigned,
+       :'e_evt_b'::bigint > :'e_evt_a'::bigint AS monotonic_b,
+       :'e_evt_c'::bigint > :'e_evt_b'::bigint AS monotonic_c;
+
+-- ---------------------------------------------------------------------
+-- Test 2: subscribe (no filter) starting at the cursor just before
+-- our test_event_a. fetch_batch returns the three events in order.
+-- ---------------------------------------------------------------------
+SELECT event_subscribe('test_sub_all',
+    NULL, ARRAY[]::text[], ARRAY[]::text[], NULL,
+    :'e_evt_a'::bigint - 1) AS sub_id \gset s_
+
+SELECT event_kind
+FROM event_fetch_batch(:'s_sub_id'::bigint, 10)
+ORDER BY event_id;
+
+-- ---------------------------------------------------------------------
+-- Test 3: ack advances the cursor; subsequent fetch returns nothing
+-- until a new event arrives, then only the new event.
+-- ---------------------------------------------------------------------
+SELECT event_ack(:'s_sub_id'::bigint, :'e_evt_c'::bigint) AS acked;
+
+SELECT count(*) AS post_ack_idle FROM event_fetch_batch(:'s_sub_id'::bigint, 10);
+
+SELECT emit_event('test_event_d', '{"task":"d"}'::jsonb) AS evt_d \gset e_
+
+SELECT event_kind
+FROM event_fetch_batch(:'s_sub_id'::bigint, 10)
+ORDER BY event_id;
+
+-- ---------------------------------------------------------------------
+-- Test 4: replay — re-fetch from a cursor earlier than the current
+-- one returns the past events. We mimic a reconnect by creating a
+-- second subscription starting at the original cursor.
+-- ---------------------------------------------------------------------
+SELECT event_subscribe('test_sub_replay',
+    NULL, ARRAY['test_event_a','test_event_b']::text[], ARRAY[]::text[], NULL,
+    :'e_evt_a'::bigint - 1) AS sub_id \gset r_
+
+SELECT count(*) AS replay_count FROM event_fetch_batch(:'r_sub_id'::bigint, 10);
+
+-- The replay subscription is filtered to only kinds a/b; c and d
+-- must NOT appear.
+SELECT event_kind FROM event_fetch_batch(:'r_sub_id'::bigint, 10) ORDER BY event_id;
+
+-- ---------------------------------------------------------------------
+-- Test 5: retrofitted V3 write paths emit events. queue_enqueue is
+-- the most reliable to test since it has no extra setup.
+-- ---------------------------------------------------------------------
+SELECT queue_register('rt_evt_queue', 5000, 0) AS qid \gset q_
+
+SELECT count(*) = 0 AS no_enqueues_yet
+  FROM malu$event WHERE event_kind = 'queue_enqueue';
+
+SELECT queue_enqueue('rt_evt_queue', '{"task":"rt"}'::jsonb) AS qjob \gset q_
+
+SELECT event_kind, payload ->> 'queue' AS queue, payload ->> 'job_id' = :'q_qjob'::text AS job_match
+FROM malu$event
+WHERE event_kind = 'queue_enqueue'
+ORDER BY event_id DESC LIMIT 1;
+
+-- ---------------------------------------------------------------------
+-- Test 6: subscription listing + audit.
+-- ---------------------------------------------------------------------
+SELECT name, cursor > 0 AS cursor_advanced
+FROM event_list_subscriptions(false)
+WHERE name IN ('test_sub_all', 'test_sub_replay')
+ORDER BY name;
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$event_delivery WHERE subscription_id IN (:'s_sub_id'::bigint, :'r_sub_id'::bigint);
+DELETE FROM malu$event_subscription WHERE subscription_id IN (:'s_sub_id'::bigint, :'r_sub_id'::bigint);
+DELETE FROM malu$queue_job WHERE queue_id = :'q_qid'::bigint;
+DELETE FROM malu$queue     WHERE queue_id = :'q_qid'::bigint;
+DELETE FROM malu$event WHERE event_kind LIKE 'test_event_%' OR event_kind = 'queue_enqueue';
+DELETE FROM malu$audit_event WHERE event_kind LIKE 'queue_%';

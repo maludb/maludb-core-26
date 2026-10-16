@@ -1,0 +1,113 @@
+-- V3-RET-01 — retrieval envelope + decision audit regression coverage.
+SET search_path TO maludb_core, public;
+-- ---------------------------------------------------------------------
+-- Test 1: retrieve_with_envelope on an empty corpus returns 0 rows
+-- but writes a malu$retrieval_envelope row with finished_at + counts.
+-- ---------------------------------------------------------------------
+SELECT count(*) AS hits_for_unknown_cue
+FROM retrieve_with_envelope('v3_ret_smoke_cue_never_seen');
+ hits_for_unknown_cue 
+----------------------
+                    0
+(1 row)
+
+SELECT cue_text, finished_at IS NOT NULL AS finished,
+       final_count, candidate_counts ? 'limit' AS has_limit
+FROM malu$retrieval_envelope
+WHERE cue_text = 'v3_ret_smoke_cue_never_seen';
+          cue_text           | finished | final_count | has_limit 
+-----------------------------+----------+-------------+-----------
+ v3_ret_smoke_cue_never_seen | t        |           0 | t
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 2: malu$retrieval_decision_audit always carries at least one
+-- 'planning' decision per envelope.
+-- ---------------------------------------------------------------------
+SELECT count(*) AS planning_decisions
+FROM malu$retrieval_decision_audit d
+JOIN malu$retrieval_envelope e ON e.envelope_id = d.envelope_id
+WHERE e.cue_text = 'v3_ret_smoke_cue_never_seen' AND d.stage = 'planning';
+ planning_decisions 
+--------------------
+                  1
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 3: retrieve_envelope_debug requires maludb_memory_auditor.
+-- The regression superuser bypasses RLS but pg_has_role still
+-- evaluates membership; the superuser is *not* a member of
+-- maludb_memory_auditor unless explicitly granted in this test.
+-- Run via a DO block under SET ROLE to a freshly granted auditor.
+-- ---------------------------------------------------------------------
+DO $body$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ret_dbg_user') THEN
+        CREATE ROLE ret_dbg_user LOGIN;
+    END IF;
+END;
+$body$;
+GRANT maludb_memory_auditor TO ret_dbg_user;
+SET ROLE ret_dbg_user;
+SET search_path TO maludb_core, public;
+SELECT envelope_id, final_count IS NOT NULL AS counted,
+       jsonb_array_length(per_stage) > 0 AS has_decisions
+FROM retrieve_envelope_debug(
+    (SELECT envelope_id FROM malu$retrieval_envelope
+     WHERE cue_text = 'v3_ret_smoke_cue_never_seen'
+     ORDER BY envelope_id DESC LIMIT 1));
+ envelope_id | counted | has_decisions 
+-------------+---------+---------------
+           2 | t       | t
+(1 row)
+
+RESET ROLE;
+SET search_path TO maludb_core, public;
+-- A role lacking maludb_memory_auditor membership is denied.
+DO $body$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ret_nondbg_user') THEN
+        CREATE ROLE ret_nondbg_user LOGIN;
+    END IF;
+END;
+$body$;
+GRANT maludb_memory_executor TO ret_nondbg_user;
+SET ROLE ret_nondbg_user;
+SET search_path TO maludb_core, public;
+DO $body$
+BEGIN
+    PERFORM retrieve_envelope_debug(
+        (SELECT envelope_id FROM maludb_core.malu$retrieval_envelope
+         WHERE cue_text = 'v3_ret_smoke_cue_never_seen'
+         ORDER BY envelope_id DESC LIMIT 1));
+    RAISE EXCEPTION 'non-auditor was allowed to debug envelope (test 3 fail)';
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'non-auditor correctly denied retrieve_envelope_debug';
+END;
+$body$;
+NOTICE:  non-auditor correctly denied retrieve_envelope_debug
+RESET ROLE;
+SET search_path TO maludb_core, public;
+-- ---------------------------------------------------------------------
+-- Test 4: audit_event coverage.
+-- ---------------------------------------------------------------------
+SELECT event_kind, count(*) AS n FROM malu$audit_event
+WHERE event_kind = 'retrieve_with_envelope'
+GROUP BY event_kind;
+       event_kind       | n 
+------------------------+---
+ retrieve_with_envelope | 1
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$retrieval_decision_audit
+WHERE envelope_id IN (SELECT envelope_id FROM malu$retrieval_envelope
+                      WHERE cue_text = 'v3_ret_smoke_cue_never_seen');
+DELETE FROM malu$retrieval_envelope WHERE cue_text = 'v3_ret_smoke_cue_never_seen';
+DELETE FROM malu$audit_event WHERE event_kind = 'retrieve_with_envelope';
+REVOKE maludb_memory_auditor FROM ret_dbg_user;
+REVOKE maludb_memory_executor FROM ret_nondbg_user;
+DROP ROLE ret_dbg_user;
+DROP ROLE ret_nondbg_user;

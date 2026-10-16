@@ -1,0 +1,80 @@
+\set ECHO none
+fork_schema_enabled
+t
+(1 row)
+source_schema_enabled
+t
+(1 row)
+public_schema_enabled
+t
+(1 row)
+skill_name|version
+sd_public_skill_to_fork|1.0.0
+(1 row)
+state_name|state_kind
+start|start
+finish|terminal
+(2 rows)
+on_outcome|ordinal
+success|10
+(1 row)
+fork_created
+t
+(1 row)
+precreated_state_map_ignored
+t
+(1 row)
+skill_name|source_owner_schema|has_source
+sd_tenant_forked_skill|maludb_public|t
+(1 row)
+keyword
+sd public keyword
+(1 row)
+subject_name
+public fork document
+(1 row)
+verb_name
+fork summarize
+(1 row)
+embedding_model|embedding_dim|source_text_hash|source_text_kind
+sd-test-embedding|4|sd-public-skill-description-hash|description
+(1 row)
+state_name|state_kind|step_jsonb|validation_jsonb
+finish|terminal|{"instruction": "return summary"}|{"required": ["summary"]}
+start|start|{"instruction": "draft summary"}|{"required": ["input"]}
+(2 rows)
+from_state|to_state|on_outcome|guard_jsonb|ordinal
+start|finish|success|{"requires": "summary"}|10
+(1 row)
+has_skill|has_keywords|has_subjects|has_verbs|has_states|has_transitions
+t|t|t|t|t|t
+(1 row)
+payload_skill_name|payload_description|payload_packaging_kind|payload_applicability|payload_precondition|payload_keyword|payload_subject|payload_verb|payload_start_state|payload_transition|payload_lineage_owner|payload_lineage_id|payload_access_visibility|payload_access_public
+t|t|t|t|t|t|t|t|t|t|t|t|t|t
+(1 row)
+public_payload_transition_details
+t
+(1 row)
+skill_name|version
+sd_shared_skill_to_fork|1.0.0
+(1 row)
+NOTICE:  OK: no-grant shared skill fork blocked
+fork_private_absent_indistinguishable
+t
+(1 row)
+NOTICE:  OK: read-only shared skill fork blocked
+shared_fork_created
+t
+(1 row)
+skill_name|source_owner_schema|has_source
+sd_shared_forked_skill|fork_source|t
+(1 row)
+keyword
+sd shared fork keyword
+(1 row)
+subject_name
+shared fork document
+(1 row)
+verb_name
+route
+(1 row)

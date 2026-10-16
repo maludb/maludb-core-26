@@ -1,0 +1,40 @@
+[Unit]
+Description=MaluDB MC2DB Listener (R1.0)
+Documentation=https://github.com/maludb/maludb-core/blob/main/docs/maludb-mc2dbd-contract.md
+After=postgresql.service network-online.target
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=maludb_mc2dbd
+Group=maludb
+EnvironmentFile=-/etc/maludb/maludb-mc2dbd.conf
+ExecStart=/usr/local/sbin/maludb_mc2dbd \
+    --foreground \
+    --host ${HOST} \
+    --port ${PORT} \
+    --pg-conninfo ${PG_CONNINFO}
+Restart=on-failure
+RestartSec=2s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/maludb
+ReadWritePaths=/var/log/maludb
+
+[Install]
+WantedBy=multi-user.target

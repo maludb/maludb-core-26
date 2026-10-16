@@ -1,0 +1,17 @@
+#!/bin/sh
+# Postinst for postgresql-18-maludb-core.
+
+set -e
+
+case "$1" in
+    configure)
+        echo "MaluDB core extension files installed for PostgreSQL 18."
+        echo "To enable in a database:"
+        echo "    sudo -u postgres psql -d <db> -c 'CREATE EXTENSION maludb_core CASCADE;'"
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

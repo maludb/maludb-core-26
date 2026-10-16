@@ -1,0 +1,137 @@
+-- Stage 4 S4-2 — Native FTS + pg_trgm.
+--
+-- Exercises:
+--   * Generated tsvector columns produce searchable lexemes
+--   * text_search returns ranked hits across object types
+--   * p_object_types filters which tables are scanned
+--   * fuzzy_subject_match returns hits above the threshold
+--   * websearch_to_tsquery handles "phrase" + "OR" + "-exclude"
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- fixture: a few rows per type ----------------------------
+SELECT register_claim(
+    p_subject => 'postgres_pool',
+    p_verb    => 'reached',
+    p_object_value => 'capacity',
+    p_statement_text => 'The postgres connection pool reached its maximum capacity at 14:22Z.'
+) AS c1 \gset
+SELECT register_claim(
+    p_subject => 'redis_cluster',
+    p_verb    => 'evicted',
+    p_object_value => 'keys',
+    p_statement_text => 'Redis cluster evicted 2k keys due to memory pressure.'
+) AS c2 \gset
+SELECT register_fact(
+    p_claim_ids => ARRAY[]::bigint[],
+    p_subject => 'postgres_pool',
+    p_verb    => 'root_cause',
+    p_object_value => 'pool_exhaustion',
+    p_statement_text => 'Verified: pool exhaustion was the root cause of the outage.'
+) AS f1 \gset
+SELECT register_memory(
+    p_memory_kind => 'lesson',
+    p_title       => 'Pool sizing lesson',
+    p_summary     => 'Default pool size of 20 is too small for peak traffic; bump to 40.',
+    p_payload_jsonb => jsonb_build_object('tags', jsonb_build_array('capacity','tuning'))
+) AS m1 \gset
+SELECT register_episode(
+    p_episode_kind => 'incident',
+    p_title        => 'Outage 2026-05-13',
+    p_summary      => 'Connection pool exhausted; site degraded for 14 minutes.',
+    p_payload_jsonb => jsonb_build_object('severity', 'P2', 'duration_min', 14)
+) AS e1 \gset
+-- ---------- tsvector is populated on insert ------------------------
+SELECT length(fts_tsv::text) > 0 AS c1_tsv_populated
+FROM malu$claim WHERE claim_id = :c1;
+ c1_tsv_populated 
+------------------
+ t
+(1 row)
+
+SELECT length(fts_tsv::text) > 0 AS m1_tsv_populated
+FROM malu$memory WHERE memory_id = :m1;
+ m1_tsv_populated 
+------------------
+ t
+(1 row)
+
+-- ---------- text_search across types -------------------------------
+SELECT object_type, object_id IN (:c1, :c2, :f1, :m1, :e1) AS expected,
+       title_or_subject
+FROM text_search('pool', p_limit => 10)
+ORDER BY rank DESC, object_id;
+  object_type   | expected |  title_or_subject  
+----------------+----------+--------------------
+ fact           | t        | postgres_pool
+ claim          | t        | postgres_pool
+ memory         | t        | Pool sizing lesson
+ episode_object | t        | Outage 2026-05-13
+(4 rows)
+
+-- Restrict to specific types
+SELECT count(*) AS claim_only_count
+FROM text_search('pool', p_object_types => ARRAY['claim'], p_limit => 10);
+ claim_only_count 
+------------------
+                1
+(1 row)
+
+SELECT count(*) AS episode_only_count
+FROM text_search('pool', p_object_types => ARRAY['episode_object'], p_limit => 10);
+ episode_only_count 
+--------------------
+                  1
+(1 row)
+
+-- ---------- websearch_to_tsquery handles phrase + exclusion --------
+-- "pool exhaustion" should hit the fact's statement
+SELECT count(*) AS phrase_hits
+FROM text_search('"pool exhaustion"', p_limit => 10);
+ phrase_hits 
+-------------
+           2
+(1 row)
+
+-- Exclusion: pool but NOT redis
+SELECT count(*) AS pool_not_redis
+FROM text_search('pool -redis', p_limit => 10);
+ pool_not_redis 
+----------------
+              4
+(1 row)
+
+-- ---------- fuzzy_subject_match -----------------------------------
+-- Slight typo: postres_pool ~ postgres_pool
+SELECT object_type, subject, similarity > 0.3 AS above_threshold
+FROM fuzzy_subject_match('postres_pool', p_threshold => 0.3)
+ORDER BY similarity DESC;
+ object_type |    subject    | above_threshold 
+-------------+---------------+-----------------
+ claim       | postgres_pool | t
+ fact        | postgres_pool | t
+(2 rows)
+
+-- No match for a totally unrelated needle
+SELECT count(*) AS no_match
+FROM fuzzy_subject_match('quantum_widget', p_threshold => 0.3);
+ no_match 
+----------
+        0
+(1 row)
+
+-- ---------- payload_jsonb participates in tsvector ----------------
+-- The memory carries tags 'capacity' and 'tuning' in payload_jsonb;
+-- searching for those should hit the memory.
+SELECT count(*) AS jsonb_searchable
+FROM text_search('tuning capacity', p_object_types => ARRAY['memory']);
+ jsonb_searchable 
+------------------
+                1
+(1 row)
+
+-- ---------- cleanup -----------------------------------------------
+DELETE FROM malu$claim          WHERE claim_id IN (:c1, :c2);
+DELETE FROM malu$fact           WHERE fact_id   = :f1;
+DELETE FROM malu$memory         WHERE memory_id = :m1;
+DELETE FROM malu$episode_object WHERE episode_id = :e1;

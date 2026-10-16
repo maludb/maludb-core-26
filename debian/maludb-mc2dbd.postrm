@@ -1,0 +1,21 @@
+#!/bin/sh
+# Postrm for maludb-mc2dbd. We deliberately do NOT delete the
+# maludb-mc2dbd system user, /etc/maludb, /var/log/maludb, or
+# /var/lib/maludb — operators may have customized configs and audit
+# logs that they will want to retain across reinstalls.
+
+set -e
+
+case "$1" in
+    purge)
+        # On purge: drop the unit drop-in directory dh_installsystemd
+        # may have created. Operator can manually remove the system
+        # user with `deluser maludb-mc2dbd` if desired.
+        rm -rf /etc/systemd/system/maludb-mc2dbd.service.d
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

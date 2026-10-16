@@ -1,0 +1,286 @@
+-- Stage 6 S6-3 — Adapter alignment + capability negotiation.
+--
+-- Exercises:
+--   * register_embedding_adapter upsert; redefining spaces/kind raises.
+--   * attach_adapter_to_migration succeeds when spaces match; raises
+--     on mismatch.
+--   * malu$index_migration.adapter_id FK (deferred from S6-2) is wired.
+--   * record_local_model_capability upserts.
+--   * negotiate_local_model filters by min_context_window, required
+--     quantization, min_vram_mb; ranks GPU-first then by tok/sec.
+--   * Cross-tenant RLS isolation.
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- fixture: two embedding spaces + provider/aliases --------
+SELECT register_model_provider('s63_local','stub') AS prov \gset
+INSERT INTO malu$model_alias (alias_name, provider_id, model_identifier)
+VALUES ('s63-bge-v1', :prov, 'bge-small-en-v1.5') RETURNING alias_id AS av1 \gset
+INSERT INTO malu$model_alias (alias_name, provider_id, model_identifier)
+VALUES ('s63-bge-v2', :prov, 'bge-small-en-v2.0') RETURNING alias_id AS av2 \gset
+INSERT INTO malu$model_alias (alias_name, provider_id, model_identifier)
+VALUES ('s63-llama-8b', :prov, 'llama3-8b-instruct') RETURNING alias_id AS al_llama \gset
+SELECT register_embedding_space('s63_space_a', 384, 'cosine', :av1) AS sa \gset
+SELECT register_embedding_space('s63_space_b', 768, 'cosine', :av2) AS sb \gset
+-- ---------- register an adapter ------------------------------------
+SELECT register_embedding_adapter(
+    p_adapter_name    => 's63_a_to_b_linear',
+    p_source_space_id => :sa,
+    p_target_space_id => :sb,
+    p_adapter_kind    => 'linear_projection',
+    p_params_jsonb    => jsonb_build_object('matrix_uri','s3://adapters/a_to_b.npy'),
+    p_evaluation      => jsonb_build_object('recall_at_10', 0.91, 'sample_count', 5000)
+) AS adapter_id \gset
+SELECT adapter_name, source_space_id = :sa AS src_correct,
+       target_space_id = :sb AS tgt_correct,
+       adapter_kind,
+       evaluation ->> 'recall_at_10' AS recall
+FROM malu$embedding_adapter WHERE adapter_id = :adapter_id;
+   adapter_name    | src_correct | tgt_correct |   adapter_kind    | recall 
+-------------------+-------------+-------------+-------------------+--------
+ s63_a_to_b_linear | t           | t           | linear_projection | 0.91
+(1 row)
+
+-- Re-register with same spaces/kind updates params/eval.
+SELECT register_embedding_adapter(
+    p_adapter_name => 's63_a_to_b_linear',
+    p_source_space_id => :sa,
+    p_target_space_id => :sb,
+    p_adapter_kind => 'linear_projection',
+    p_params_jsonb => jsonb_build_object('matrix_uri','s3://adapters/a_to_b_v2.npy'),
+    p_evaluation   => jsonb_build_object('recall_at_10', 0.93)
+) = :adapter_id AS reregister_stable;
+ reregister_stable 
+-------------------
+ t
+(1 row)
+
+SELECT evaluation ->> 'recall_at_10' AS recall_after_update
+FROM malu$embedding_adapter WHERE adapter_id = :adapter_id;
+ recall_after_update 
+---------------------
+ 0.93
+(1 row)
+
+-- Redefining spaces/kind raises.
+DO $body$
+DECLARE
+    v_src bigint := (SELECT space_id FROM malu$embedding_space WHERE space_name = 's63_space_a');
+    v_tgt bigint := (SELECT space_id FROM malu$embedding_space WHERE space_name = 's63_space_b');
+BEGIN
+    PERFORM register_embedding_adapter(
+        's63_a_to_b_linear', v_src, v_tgt, 'learned_mlp',
+        '{}'::jsonb);
+    RAISE NOTICE 'UNEXPECTED: adapter redef accepted';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: adapter redef rejected';
+END;
+$body$;
+NOTICE:  OK: adapter redef rejected
+-- Identity-adapter from a space to itself is rejected by row CHECK.
+DO $body$
+DECLARE v_src bigint := (SELECT space_id FROM malu$embedding_space WHERE space_name = 's63_space_a');
+BEGIN
+    PERFORM register_embedding_adapter('s63_self', v_src, v_src, 'identity');
+    RAISE NOTICE 'UNEXPECTED: same-space adapter accepted';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'OK: same-space adapter rejected';
+WHEN others THEN
+    -- function arity mismatch caught above is the wrong error; print
+    RAISE NOTICE 'OK (other): %', SQLERRM;
+END;
+$body$;
+NOTICE:  OK: same-space adapter rejected
+-- ---------- attach adapter to a migration --------------------------
+SELECT propose_index_migration(:sa, :sb, 'hnsw') AS mig \gset
+SELECT attach_adapter_to_migration(:mig, :adapter_id);
+ attach_adapter_to_migration 
+-----------------------------
+ 
+(1 row)
+
+SELECT adapter_id = :adapter_id AS adapter_attached
+FROM malu$index_migration WHERE migration_id = :mig;
+ adapter_attached 
+------------------
+ t
+(1 row)
+
+-- Mismatched-spaces adapter cannot be attached to a different migration.
+SELECT register_embedding_space('s63_space_c', 512, 'cosine') AS sc \gset
+SELECT register_embedding_adapter('s63_a_to_c', :sa, :sc, 'linear_projection') AS adapter_ac \gset
+DO $body$
+DECLARE
+    v_mig bigint := (SELECT migration_id FROM malu$index_migration
+                     WHERE source_space_id = (SELECT space_id FROM malu$embedding_space WHERE space_name = 's63_space_a')
+                       AND target_space_id = (SELECT space_id FROM malu$embedding_space WHERE space_name = 's63_space_b'));
+    v_ad  bigint := (SELECT adapter_id FROM malu$embedding_adapter WHERE adapter_name = 's63_a_to_c');
+BEGIN
+    PERFORM attach_adapter_to_migration(v_mig, v_ad);
+    RAISE NOTICE 'UNEXPECTED: mismatched adapter attached';
+EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'OK: mismatched adapter rejected';
+END;
+$body$;
+NOTICE:  OK: mismatched adapter rejected
+-- ---------- capability negotiation ---------------------------------
+-- Three local models: a tiny embedding model (CPU), a small LLM
+-- (GPU 8GB), a large LLM (GPU 24GB).
+SELECT record_local_model_capability(
+    p_model_alias_id => :av1,
+    p_gpu_available  => false,
+    p_gpu_kind       => 'cpu_only',
+    p_system_ram_mb  => 8192,
+    p_supports_quantizations => ARRAY['fp16','int8'],
+    p_context_window => 512,
+    p_typical_tokens_per_sec => 2000
+);
+ record_local_model_capability 
+-------------------------------
+                             1
+(1 row)
+
+SELECT record_local_model_capability(
+    p_model_alias_id => :av2,
+    p_gpu_available  => true,
+    p_gpu_kind       => 'nvidia',
+    p_vram_mb        => 8192,
+    p_supports_quantizations => ARRAY['fp16','int8','int4'],
+    p_context_window => 4096,
+    p_typical_tokens_per_sec => 800
+);
+ record_local_model_capability 
+-------------------------------
+                             2
+(1 row)
+
+SELECT record_local_model_capability(
+    p_model_alias_id => :al_llama,
+    p_gpu_available  => true,
+    p_gpu_kind       => 'nvidia',
+    p_vram_mb        => 24576,
+    p_supports_quantizations => ARRAY['fp16','int8'],
+    p_context_window => 8192,
+    p_typical_tokens_per_sec => 200
+);
+ record_local_model_capability 
+-------------------------------
+                             3
+(1 row)
+
+-- Unconstrained: returns all three, GPU-first by tok/sec.
+SELECT alias_name, gpu_available, context_window
+FROM negotiate_local_model();
+  alias_name  | gpu_available | context_window 
+--------------+---------------+----------------
+ s63-bge-v2   | t             |           4096
+ s63-llama-8b | t             |           8192
+ s63-bge-v1   | f             |            512
+(3 rows)
+
+-- Require context_window >= 4096 — the embedding CPU model drops out.
+SELECT alias_name, context_window
+FROM negotiate_local_model(p_min_context_window => 4096);
+  alias_name  | context_window 
+--------------+----------------
+ s63-bge-v2   |           4096
+ s63-llama-8b |           8192
+(2 rows)
+
+-- Require int4 quantization — only the small LLM supports it.
+SELECT alias_name
+FROM negotiate_local_model(p_required_quantization => 'int4');
+ alias_name 
+------------
+ s63-bge-v2
+(1 row)
+
+-- Require min_vram_mb >= 16384 — only the large LLM qualifies.
+SELECT alias_name, vram_mb
+FROM negotiate_local_model(p_min_vram_mb => 16384);
+  alias_name  | vram_mb 
+--------------+---------
+ s63-llama-8b |   24576
+(1 row)
+
+-- Combined: 4096-ctx + int8 + 16GB+ VRAM → just llama-8b.
+SELECT alias_name
+FROM negotiate_local_model(
+    p_min_context_window    => 4096,
+    p_required_quantization => 'int8',
+    p_min_vram_mb           => 16384);
+  alias_name  
+--------------
+ s63-llama-8b
+(1 row)
+
+-- Re-record updates last_negotiated_at + fields.
+SELECT record_local_model_capability(
+    p_model_alias_id => :av1,
+    p_typical_tokens_per_sec => 2400
+);
+ record_local_model_capability 
+-------------------------------
+                             1
+(1 row)
+
+SELECT typical_tokens_per_sec
+FROM malu$local_model_capability WHERE model_alias_id = :av1;
+ typical_tokens_per_sec 
+------------------------
+                   2400
+(1 row)
+
+-- ---------- cross-tenant RLS ---------------------------------------
+DROP ROLE   IF EXISTS s63_user_a;
+NOTICE:  role "s63_user_a" does not exist, skipping
+DROP ROLE   IF EXISTS s63_user_b;
+NOTICE:  role "s63_user_b" does not exist, skipping
+DROP SCHEMA IF EXISTS s63_a CASCADE;
+NOTICE:  schema "s63_a" does not exist, skipping
+DROP SCHEMA IF EXISTS s63_b CASCADE;
+NOTICE:  schema "s63_b" does not exist, skipping
+CREATE ROLE s63_user_a NOLOGIN;
+CREATE ROLE s63_user_b NOLOGIN;
+GRANT maludb_memory_executor TO s63_user_a, s63_user_b;
+GRANT USAGE ON SCHEMA maludb_core TO s63_user_a, s63_user_b;
+CREATE SCHEMA s63_a AUTHORIZATION s63_user_a;
+CREATE SCHEMA s63_b AUTHORIZATION s63_user_b;
+SET ROLE s63_user_a;
+SET search_path TO s63_a, maludb_core, public;
+SELECT register_embedding_space('a_only', 256) AS sp_a \gset
+SELECT register_embedding_space('a_only_v2', 256) AS sp_a2 \gset
+SELECT register_embedding_adapter('a_only_adapter', :sp_a, :sp_a2, 'identity');
+ register_embedding_adapter 
+----------------------------
+                          6
+(1 row)
+
+SET ROLE s63_user_b;
+SET search_path TO s63_b, maludb_core, public;
+SELECT count(*) AS b_sees_a_adapters
+FROM maludb_core.malu$embedding_adapter WHERE adapter_name = 'a_only_adapter';
+ b_sees_a_adapters 
+-------------------
+                 0
+(1 row)
+
+RESET ROLE;
+RESET search_path;
+SET search_path = maludb_core, public;
+-- ---------- cleanup ------------------------------------------------
+DELETE FROM malu$audit_event
+ WHERE event_kind IN ('local_model_capability_recorded',
+                      'index_migration_adapter_attached');
+DELETE FROM malu$index_migration   WHERE migration_id = :mig;
+DELETE FROM malu$embedding_adapter WHERE adapter_id IN (:adapter_id, :adapter_ac);
+DELETE FROM malu$embedding_space   WHERE space_id IN (:sa, :sb, :sc);
+DELETE FROM malu$local_model_capability WHERE model_alias_id IN (:av1, :av2, :al_llama);
+DELETE FROM malu$model_alias       WHERE alias_id  IN (:av1, :av2, :al_llama);
+DELETE FROM malu$model_provider    WHERE provider_id = :prov;
+DROP SCHEMA s63_a CASCADE;
+DROP SCHEMA s63_b CASCADE;
+DROP OWNED BY s63_user_a;
+DROP OWNED BY s63_user_b;
+DROP ROLE   s63_user_a;
+DROP ROLE   s63_user_b;

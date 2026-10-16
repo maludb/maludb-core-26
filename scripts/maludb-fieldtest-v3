@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""V3 field-test orchestration.
+
+Walks every shipped V3 surface end-to-end against an installed
+MaluDB host (default DB: contrib_regression). Designed to be run
+AFTER the catalog-layer suites (pg_regress / service smokes / CLI
+smoke) have all gone green, so any failure here is a structural
+regression rather than a wiring bug in one piece.
+
+Each scenario step asserts the SQL artefact + the matching audit
+row. The runner writes a structured report to stdout and exits
+non-zero on any failure.
+
+Usage:
+    scripts/maludb-fieldtest-v3
+    MALUDB_FT_DB=maludb scripts/maludb-fieldtest-v3
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+
+import psycopg
+
+
+DB     = os.environ.get("MALUDB_FT_DB", "contrib_regression")
+HOST   = os.environ.get("MALUDB_FT_HOST")
+PORT   = os.environ.get("MALUDB_FT_PORT")
+USER   = os.environ.get("MALUDB_FT_USER")
+PASS   = os.environ.get("MALUDB_FT_PASS")
+
+# Per-run tag so re-running doesn't collide on UNIQUE constraints.
+TAG = f"v3ft-{int(time.time())}"
+
+
+PASS_COUNT = 0
+FAIL_COUNT = 0
+WARN_COUNT = 0
+RESULTS: list[dict] = []
+
+
+def _check(name: str, cond: bool, detail: str = "") -> None:
+    global PASS_COUNT, FAIL_COUNT
+    status = "PASS" if cond else "FAIL"
+    if cond:
+        PASS_COUNT += 1
+    else:
+        FAIL_COUNT += 1
+    print(f"  [{status}] {name}" + (f"  -- {detail}" if detail else ""))
+    RESULTS.append({"name": name, "status": status, "detail": detail})
+
+
+def _warn(name: str, detail: str = "") -> None:
+    global WARN_COUNT
+    WARN_COUNT += 1
+    print(f"  [WARN] {name}" + (f"  -- {detail}" if detail else ""))
+    RESULTS.append({"name": name, "status": "WARN", "detail": detail})
+
+
+def _dsn() -> str:
+    parts = [f"dbname={DB}"]
+    for k, v in (("host", HOST), ("port", PORT), ("user", USER), ("password", PASS)):
+        if v:
+            parts.append(f"{k}={v}")
+    parts.append("application_name=maludb-fieldtest-v3")
+    return " ".join(parts)
+
+
+@contextmanager
+def conn():
+    c = psycopg.connect(_dsn(), autocommit=True)
+    try:
+        with c.cursor() as cur:
+            cur.execute("SET search_path TO maludb_core, public")
+        yield c
+    finally:
+        c.close()
+
+
+def _section(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+
+# =====================================================================
+# Field test scenarios
+# =====================================================================
+
+
+def stage_8_doc_consistency() -> None:
+    _section("Stage 8 (V3-DOC-01/02) — doc consistency gate")
+    rc = os.system("/home/maludb/maludb-core/scripts/maludb-check-doc-consistency > /tmp/v3ft-doc.out 2>&1")
+    _check("doc-consistency script returns 0", rc == 0,
+           open("/tmp/v3ft-doc.out").read().strip() if rc else "")
+
+
+def stage_9_auth_secret() -> None:
+    _section("Stage 9 (V3-AUTH-01 + V3-SECRET-01) — tokens + secrets")
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "INSERT INTO malu$account(account_name, account_kind, description) "
+            "VALUES (%s, 'service', 'V3 field-test')",
+            (f"{TAG}_acct",),
+        )
+        cur.execute("SELECT account_id FROM malu$account WHERE account_name = %s",
+                    (f"{TAG}_acct",))
+        aid = cur.fetchone()[0]
+
+        cur.execute("SELECT token_id, plaintext_token FROM auth_token_create(%s, 'service', %s)",
+                    (aid, f"{TAG}-token"))
+        tid, tok = cur.fetchone()
+        _check("auth_token_create returns plaintext", tok and tok.startswith("mldbat_"),
+               f"token_id={tid}")
+
+        cur.execute("SELECT account_id FROM auth_token_verify(%s, NULL)", (tok,))
+        row = cur.fetchone()
+        _check("auth_token_verify round-trips to account",
+               row is not None and row[0] == aid)
+
+        cur.execute(
+            "SELECT secret_id, version FROM secret_set(%s, 'provider', 'sk-test-ft-9999')",
+            (f"{TAG}_secret",))
+        sid, ver = cur.fetchone()
+        _check("secret_set returns version=1", ver == 1, f"secret_id={sid}")
+
+        cur.execute("SELECT current_version, mode FROM secret_get_metadata(%s)",
+                    (f"{TAG}_secret",))
+        ver, mode = cur.fetchone()
+        _check("secret_get_metadata is inline mode", mode == "inline")
+
+    return aid, tok, tid
+
+
+def stage_10_rest_catalog() -> None:
+    _section("Stage 10 (V3-API-01a) — REST endpoint catalog")
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT rest_register_endpoint('GET', %s, "
+            "'maludb_core.maludb_core_version()'::regprocedure, %s, "
+            "ARRAY[]::text[], 'read_only', '{}'::jsonb, false)",
+            (f"/{TAG}/version", "V3 field-test endpoint"),
+        )
+        eid = cur.fetchone()[0]
+        _check("rest_register_endpoint returns id > 0", eid > 0,
+               f"endpoint_id={eid}")
+
+        cur.execute("SELECT method, path FROM rest_list_endpoints() WHERE path = %s",
+                    (f"/{TAG}/version",))
+        row = cur.fetchone()
+        _check("rest_list_endpoints surfaces the registered endpoint",
+               row is not None and row[0] == "GET")
+
+
+def stage_11_queue_cron() -> None:
+    _section("Stage 11 (V3-QUEUE-01 + V3-CRON-01) — queue + scheduler")
+    qname = f"{TAG}_q"
+    sname = f"{TAG}_sched"
+    with conn() as c, c.cursor() as cur:
+        cur.execute("SELECT queue_register(%s, 5000, 1)", (qname,))
+        qid = cur.fetchone()[0]
+        _check("queue_register returns id", qid > 0)
+
+        cur.execute("SELECT queue_enqueue(%s, %s::jsonb)", (qname, '{"task":"ft"}'))
+        jid = cur.fetchone()[0]
+        _check("queue_enqueue returns job_id", jid > 0)
+
+        cur.execute("SELECT schedule_create(%s, '*/5 * * * *', 'enqueue', %s::jsonb)",
+                    (sname, json.dumps({"queue": qname, "payload": {"task": "cron-ft"}})))
+        sid = cur.fetchone()[0]
+        _check("schedule_create returns id", sid > 0)
+
+        cur.execute("SELECT schedule_run_now(%s)", (sname,))
+        run_id = cur.fetchone()[0]
+        _check("schedule_run_now returns run_id", run_id > 0)
+
+
+def stage_12_source_archive() -> None:
+    _section("Stage 12 (V3-STOR-01) — source archive")
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix=f"{TAG}-arc-") as base, conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT register_storage_adapter(%s, 'local_fs', %s::jsonb)",
+            (f"{TAG}_adapter", json.dumps({"base_path": base})),
+        )
+        aid = cur.fetchone()[0]
+        _check("register_storage_adapter returns id", aid > 0)
+
+        payload = b"V3 field-test source object bytes"
+        h = hashlib.sha256(payload).digest()
+        h_hex = h.hex()
+        path = os.path.join(base, h_hex[0:2], h_hex[2:4], h_hex)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(payload)
+        cur.execute(
+            "SELECT source_object_register(%s, %s, %s::bytea, %s, 'text/plain')",
+            (f"{TAG}_adapter", os.path.relpath(path, base), h, len(payload)),
+        )
+        oid = cur.fetchone()[0]
+        _check("source_object_register returns object_id", oid > 0)
+
+        # Promotion path requires a source_type row.
+        cur.execute(
+            "INSERT INTO malu$source_type(source_type, stage, description) "
+            "VALUES (%s, 2, 'field test') ON CONFLICT DO NOTHING",
+            (f"{TAG}_st",),
+        )
+        cur.execute(
+            "SELECT source_object_promote_to_source_package(%s, %s, NULL, %s)",
+            (oid, f"{TAG}_st", payload.decode("utf-8")),
+        )
+        pid = cur.fetchone()[0]
+        _check("source_object_promote_to_source_package returns package_id", pid > 0)
+
+        # Derivation Ledger entry exists.
+        cur.execute(
+            "SELECT count(*) FROM malu$derivation_ledger "
+            "WHERE derived_object_type = 'source_package' AND derived_object_id = %s",
+            (pid,),
+        )
+        _check("Derivation Ledger entry recorded for promotion", cur.fetchone()[0] == 1)
+
+
+def stage_13_realtime_presence() -> None:
+    _section("Stage 13 (V3-REALTIME-01 + V3-PRESENCE-01) — events + presence")
+    with conn() as c, c.cursor() as cur:
+        cur.execute("SELECT MAX(event_id) FROM malu$event")
+        cursor_start = cur.fetchone()[0] or 0
+
+        cur.execute(
+            "SELECT event_subscribe(%s, NULL, ARRAY[]::text[], ARRAY[]::text[], NULL, %s)",
+            (f"{TAG}_sub", cursor_start),
+        )
+        sub = cur.fetchone()[0]
+        _check("event_subscribe returns subscription_id", sub > 0)
+
+        cur.execute("SELECT emit_event(%s, %s::jsonb)", (f"{TAG}_evt", '{"hi":"ft"}'))
+        eid = cur.fetchone()[0]
+        _check("emit_event returns event_id", eid > 0)
+
+        cur.execute("SELECT count(*) FROM event_fetch_batch(%s, 100)", (sub,))
+        _check("event_fetch_batch sees emitted event", cur.fetchone()[0] >= 1)
+
+        cur.execute("SELECT event_ack(%s, %s)", (sub, eid))
+        n = cur.fetchone()[0]
+        _check("event_ack records delivery rows", n >= 1)
+
+        cur.execute("SELECT create_active_memory_pool(%s, 'sql')", (f"{TAG}_pool",))
+        pool = cur.fetchone()[0]
+        cur.execute("SELECT presence_update(%s, 'human', 'ft-user', 'reviewer', 'field test')",
+                    (pool,))
+        pres = cur.fetchone()[0]
+        _check("presence_update returns presence_id", pres > 0)
+
+
+def stage_14_vec_embed_ret() -> None:
+    _section("Stage 14 (V3-VEC-01 + V3-EMBED-01 + V3-RET-01) — vectors, embeddings, retrieval")
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT register_vector_compartment(%s, 'subj', 'verb', 3, 'ft-3d', 'cosine')",
+            (f"{TAG}_vec",),
+        )
+        comp = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO malu$vector_chunk(compartment_id, source_text, embedding, "
+            "embedding_dim, embedding_model, metadata) VALUES "
+            "(%s, 'ft-doc', vector_from_real_array(ARRAY[1.0, 0.0, 0.0]::real[]), 3, "
+            "'ft-3d', %s::jsonb)",
+            (comp, json.dumps({"language": "en"})),
+        )
+
+        cur.execute("SELECT vector_index_record(%s, 'exact', true, 0, 0, NULL)", (comp,))
+        sid = cur.fetchone()[0]
+        _check("vector_index_record returns status_id", sid > 0)
+
+        cur.execute(
+            "SELECT count(*) FROM search_memory_filter(%s, 'subj', 'verb', "
+            "vector_from_real_array(ARRAY[1.0, 0.0, 0.0]::real[]), %s::jsonb, 10)",
+            (f"{TAG}_vec", json.dumps({"language": "en"})),
+        )
+        _check("search_memory_filter returns the metadata-matched row",
+               cur.fetchone()[0] >= 1)
+
+        # Embedding pipeline needs a model alias to FK the ledger entry.
+        cur.execute(
+            "SELECT register_model_provider(%s, 'local_runtime', 'ft-echo')",
+            (f"{TAG}_prov",))
+        cur.execute("SELECT register_model_alias(%s, %s, 'ft-echo')",
+                    (f"{TAG}_alias", f"{TAG}_prov"))
+        cur.execute(
+            "SELECT embedding_enqueue('memory_chunk', 1, %s, 'ft-space', NULL, '1.0.0')",
+            (f"{TAG}_alias",),
+        )
+        ejid = cur.fetchone()[0]
+        _check("embedding_enqueue returns job_id", ejid > 0)
+
+        cur.execute(
+            "SELECT output_id FROM embedding_record_output(%s, "
+            "vector_from_real_array(ARRAY[0.1, 0.2, 0.3]::real[]), 3, %s, %s::bytea)",
+            (ejid, "subject=ft verb=ran predicate=test object=hello",
+             hashlib.sha256(b"ft-out").digest()),
+        )
+        eoid = cur.fetchone()[0]
+        _check("embedding_record_output returns output_id", eoid > 0)
+
+        cur.execute(
+            "SELECT count(*) FROM retrieve_with_envelope(%s)",
+            (f"{TAG}-no-match-cue",),
+        )
+        cur.fetchone()
+        cur.execute("SELECT count(*) FROM malu$retrieval_envelope WHERE cue_text = %s",
+                    (f"{TAG}-no-match-cue",))
+        _check("retrieve_with_envelope records envelope row",
+               cur.fetchone()[0] == 1)
+
+
+def stage_15_ops() -> None:
+    _section("Stage 15 (V3-OBS/LOG/BACKUP/ENV/REPL) — operations")
+    with conn() as c, c.cursor() as cur:
+        cur.execute("SELECT length(metrics_prometheus_scrape())")
+        n = cur.fetchone()[0]
+        _check("metrics_prometheus_scrape returns body", n > 200, f"{n} bytes")
+
+        cur.execute(
+            "SELECT log_drain_set(%s, 'file', %s::jsonb, "
+            "ARRAY['audit_event','rest_invocation']::text[])",
+            (f"{TAG}_drain", json.dumps({"path": f"/tmp/{TAG}.jsonl"})),
+        )
+        did = cur.fetchone()[0]
+        _check("log_drain_set returns drain_id", did > 0)
+
+        cur.execute(
+            "SELECT backup_manifest_record(%s, 'dump', %s, %s::jsonb)",
+            (f"{TAG}-backup", f"file:///tmp/{TAG}.dump",
+             json.dumps({"dump_sha256": "deadbeef"})),
+        )
+        mid = cur.fetchone()[0]
+        _check("backup_manifest_record returns manifest_id", mid > 0)
+
+        cur.execute(
+            "SELECT preview_env_create(%s, '0.57.0', %s::jsonb)",
+            (f"{TAG}_env", json.dumps({"production_data": False})),
+        )
+        eid = cur.fetchone()[0]
+        _check("preview_env_create returns env_id", eid > 0)
+
+        ok = os.path.exists("/home/maludb/maludb-core/docs/v3/read-replicas.md")
+        _check("V3-REPL-01 doc present", ok, "docs/v3/read-replicas.md")
+
+
+def teardown() -> None:
+    _section("Teardown")
+    # Best-effort cleanup; the field test is idempotent under a fresh TAG so
+    # leftover rows from a partial run don't block subsequent runs.
+    with conn() as c, c.cursor() as cur:
+        for sql, args in [
+            ("DELETE FROM malu$event_delivery WHERE subscription_id IN (SELECT subscription_id FROM malu$event_subscription WHERE name = %s)", (f"{TAG}_sub",)),
+            ("DELETE FROM malu$event_subscription WHERE name = %s", (f"{TAG}_sub",)),
+            ("DELETE FROM malu$event WHERE event_kind = %s", (f"{TAG}_evt",)),
+            ("DELETE FROM malu$pool_presence_event WHERE presence_id IN (SELECT presence_id FROM malu$pool_presence WHERE participant_ref = 'ft-user')", ()),
+            ("DELETE FROM malu$pool_presence WHERE participant_ref = 'ft-user'", ()),
+            ("DELETE FROM malu$active_memory_pool WHERE pool_name = %s", (f"{TAG}_pool",)),
+            ("DELETE FROM malu$queue_job WHERE queue_id IN (SELECT queue_id FROM malu$queue WHERE name IN (%s,'embed'))", (f"{TAG}_q",)),
+            ("DELETE FROM malu$queue WHERE name = %s", (f"{TAG}_q",)),
+            ("DELETE FROM malu$queue WHERE name = 'embed'", ()),
+            ("DELETE FROM malu$schedule_run WHERE schedule_id IN (SELECT schedule_id FROM malu$schedule WHERE name = %s)", (f"{TAG}_sched",)),
+            ("DELETE FROM malu$schedule WHERE name = %s", (f"{TAG}_sched",)),
+            ("DELETE FROM malu$rest_endpoint WHERE path LIKE %s", (f"/{TAG}/%",)),
+            ("DELETE FROM malu$embedding_output WHERE job_id IN (SELECT job_id FROM malu$embedding_job WHERE model_alias = %s)", (f"{TAG}_alias",)),
+            ("DELETE FROM malu$embedding_job WHERE model_alias = %s", (f"{TAG}_alias",)),
+            ("DELETE FROM malu$model_alias WHERE alias_name = %s", (f"{TAG}_alias",)),
+            ("DELETE FROM malu$model_provider WHERE provider_name = %s", (f"{TAG}_prov",)),
+            ("DELETE FROM malu$vector_index_status WHERE compartment_id IN (SELECT compartment_id FROM malu$vector_compartment WHERE namespace = %s)", (f"{TAG}_vec",)),
+            ("DELETE FROM malu$vector_chunk WHERE compartment_id IN (SELECT compartment_id FROM malu$vector_compartment WHERE namespace = %s)", (f"{TAG}_vec",)),
+            ("DELETE FROM malu$vector_compartment WHERE namespace = %s", (f"{TAG}_vec",)),
+            ("DELETE FROM malu$retrieval_decision_audit WHERE envelope_id IN (SELECT envelope_id FROM malu$retrieval_envelope WHERE cue_text = %s)", (f"{TAG}-no-match-cue",)),
+            ("DELETE FROM malu$retrieval_envelope WHERE cue_text = %s", (f"{TAG}-no-match-cue",)),
+            ("DELETE FROM malu$derivation_ledger WHERE derived_object_type = 'source_package' AND derived_object_id IN (SELECT source_package_id FROM malu$source_package WHERE source_type = %s)", (f"{TAG}_st",)),
+            ("DELETE FROM malu$source_package WHERE source_type = %s", (f"{TAG}_st",)),
+            ("DELETE FROM malu$source_type WHERE source_type = %s", (f"{TAG}_st",)),
+            ("DELETE FROM malu$source_object_reference WHERE object_id IN (SELECT object_id FROM malu$source_object WHERE adapter_id IN (SELECT adapter_id FROM malu$storage_adapter WHERE name = %s))", (f"{TAG}_adapter",)),
+            ("DELETE FROM malu$source_object WHERE adapter_id IN (SELECT adapter_id FROM malu$storage_adapter WHERE name = %s)", (f"{TAG}_adapter",)),
+            ("DELETE FROM malu$storage_adapter WHERE name = %s", (f"{TAG}_adapter",)),
+            ("DELETE FROM malu$log_drain_run WHERE drain_id = (SELECT drain_id FROM malu$log_drain WHERE name = %s)", (f"{TAG}_drain",)),
+            ("DELETE FROM malu$log_drain WHERE name = %s", (f"{TAG}_drain",)),
+            ("DELETE FROM malu$backup_verification WHERE manifest_id IN (SELECT manifest_id FROM malu$backup_manifest WHERE label = %s)", (f"{TAG}-backup",)),
+            ("DELETE FROM malu$backup_manifest WHERE label = %s", (f"{TAG}-backup",)),
+            ("DELETE FROM malu$preview_env_seed WHERE env_id IN (SELECT env_id FROM malu$preview_env WHERE name = %s)", (f"{TAG}_env",)),
+            ("DELETE FROM malu$preview_env WHERE name = %s", (f"{TAG}_env",)),
+            ("DELETE FROM malu$secret_use WHERE secret_version_id IN (SELECT secret_version_id FROM malu$secret_version WHERE secret_id IN (SELECT secret_id FROM malu$secret WHERE name = %s))", (f"{TAG}_secret",)),
+            ("DELETE FROM malu$secret_version WHERE secret_id IN (SELECT secret_id FROM malu$secret WHERE name = %s)", (f"{TAG}_secret",)),
+            ("DELETE FROM malu$secret WHERE name = %s", (f"{TAG}_secret",)),
+            ("DELETE FROM malu$auth_token_use WHERE token_id IN (SELECT token_id FROM malu$auth_token WHERE account_id IN (SELECT account_id FROM malu$account WHERE account_name = %s))", (f"{TAG}_acct",)),
+            ("DELETE FROM malu$auth_token WHERE account_id IN (SELECT account_id FROM malu$account WHERE account_name = %s)", (f"{TAG}_acct",)),
+            ("DELETE FROM malu$account WHERE account_name = %s", (f"{TAG}_acct",)),
+            # psycopg parses '%' inside LIKE patterns even when there are no
+            # bind parameters; use the SQL escape '%%' or pass the LIKE
+            # patterns as bind values to dodge the substitution lexer.
+            ("DELETE FROM malu$audit_event WHERE event_kind ~ '^(auth_token|secret|queue|schedule|rest_endpoint|embedding|vector|storage|source_object|log_drain|backup|preview_env|pool_presence)_' OR event_kind = 'retrieve_with_envelope'", ()),
+            ("DELETE FROM malu$event WHERE event_kind ~ '^(pool_presence|queue_enqueue|source_object_register|vector_index_record)'", ()),
+        ]:
+            try:
+                cur.execute(sql, args)
+            except Exception as e:
+                _warn(f"teardown sql failed: {sql[:60]}…", str(e)[:80])
+
+
+def main() -> int:
+    print(f"V3 field test — tag={TAG} db={DB}")
+    try:
+        stage_8_doc_consistency()
+        stage_9_auth_secret()
+        stage_10_rest_catalog()
+        stage_11_queue_cron()
+        stage_12_source_archive()
+        stage_13_realtime_presence()
+        stage_14_vec_embed_ret()
+        stage_15_ops()
+    finally:
+        teardown()
+
+    print(f"\nResult: {PASS_COUNT} pass / {FAIL_COUNT} fail / {WARN_COUNT} warn")
+    if "--json" in sys.argv:
+        json.dump({"tag": TAG, "pass": PASS_COUNT, "fail": FAIL_COUNT,
+                   "warn": WARN_COUNT, "results": RESULTS}, sys.stdout, indent=2)
+        print()
+    return 0 if FAIL_COUNT == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

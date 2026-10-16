@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maludb-pageindexd"
+version = "0.1.0"
+description = "MaluDB PageIndex / ChatIndex builder daemon — promotes Source Packages to navigable trees over the V3 queue and model gateway."
+readme = "README.md"
+license = { text = "PostgreSQL" }
+requires-python = ">=3.10"
+authors = [{ name = "Edward Honour", email = "ed@maludb.org" }]
+keywords = ["maludb", "pageindex", "chatindex", "postgres", "pdf"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: PostgreSQL License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: Text Processing :: Markup",
+]
+
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "pypdf>=4.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+maludb-pageindexd = "maludb_pageindexd.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maludb_pageindexd"]

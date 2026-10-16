@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# maludb-model-runtime-check — validate the local model runtime (llama.cpp).
+#
+# Two modes:
+#   --mode=stub    Deterministic, hardware-free path for CI and dev hosts
+#                  without a model. Emits a fixed structured response that
+#                  encodes a SHA256 of the prompt; never reads files; always
+#                  exits 0 unless invoked incorrectly.
+#   --mode=local   Real check. Verifies that the llama-cli binary exists and
+#                  is executable, that the model file exists (and matches an
+#                  optional SHA256), and runs a tiny completion smoke test.
+#
+# Default mode is stub. Field-test installation MUST exercise --mode=local
+# at least once.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")"/.. && pwd)"
+DEFAULT_BIN="$ROOT_DIR/third_party/llama.cpp/build/bin/llama-cli"
+
+MODE="stub"
+LLAMA_BIN=""
+MODEL_PATH=""
+EXPECT_HASH=""
+PROMPT="MaluDB readiness probe."
+MAX_TOKENS=16
+QUIET=0
+JSON=0
+
+usage() {
+    cat <<'USAGE'
+Usage: maludb-model-runtime-check [--mode=stub|local] [options]
+
+Default --mode=stub returns deterministic hardware-free output for CI.
+--mode=local exercises the real llama.cpp runtime against a model file.
+
+Common options:
+  --quiet           Suppress non-error output.
+  --json            Emit single-line JSON on stdout.
+  -h, --help        Show this help.
+
+--mode=local options:
+  --bin=PATH        Path to llama-cli (default: third_party/llama.cpp build).
+  --model=PATH      Path to a GGUF model file (required).
+  --expect-hash=HEX Optional SHA256 of the model file; mismatch is fatal.
+  --prompt=TEXT     Prompt for the smoke test (default deterministic).
+  --max-tokens=N    Tokens to generate in the smoke test (default 16).
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mode=*)        MODE="${1#*=}"; shift ;;
+        --bin=*)         LLAMA_BIN="${1#*=}"; shift ;;
+        --model=*)       MODEL_PATH="${1#*=}"; shift ;;
+        --expect-hash=*) EXPECT_HASH="${1#*=}"; shift ;;
+        --prompt=*)      PROMPT="${1#*=}"; shift ;;
+        --max-tokens=*)  MAX_TOKENS="${1#*=}"; shift ;;
+        --quiet)         QUIET=1; shift ;;
+        --json)          JSON=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        *) echo "maludb-model-runtime-check: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+log()  { [[ $QUIET -eq 0 && $JSON -eq 0 ]] && echo "$*"; return 0; }
+fail() { echo "FAIL: $*" >&2; }
+
+sha256_of_string() {
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+}
+
+sha256_of_file() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+emit_json() {
+    # status, mode, bin, model, prompt_hash, model_hash, reason
+    printf '{"status":"%s","mode":"%s","bin":"%s","model":"%s","prompt_hash":"%s","model_hash":"%s","reason":"%s"}\n' \
+        "$1" "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}"
+}
+
+case "$MODE" in
+    stub)
+        PROMPT_HASH=$(sha256_of_string "$PROMPT")
+        if [[ $JSON -eq 1 ]]; then
+            emit_json "ok" "stub" "" "" "$PROMPT_HASH" "" ""
+        else
+            log "stub OK: prompt_hash=$PROMPT_HASH reply=MALUDB_STUB_REPLY"
+        fi
+        exit 0
+        ;;
+    local)
+        if [[ -z "$LLAMA_BIN" ]]; then
+            LLAMA_BIN="$DEFAULT_BIN"
+        fi
+        if [[ -z "$MODEL_PATH" ]]; then
+            fail "--model=PATH is required in --mode=local"
+            exit 2
+        fi
+        if [[ ! -x "$LLAMA_BIN" ]]; then
+            fail "llama-cli not executable at $LLAMA_BIN — run 'make -C runtime' first"
+            exit 1
+        fi
+        if [[ ! -f "$MODEL_PATH" ]]; then
+            fail "model file not found: $MODEL_PATH"
+            exit 1
+        fi
+
+        MODEL_HASH=$(sha256_of_file "$MODEL_PATH")
+        if [[ -n "$EXPECT_HASH" && "$EXPECT_HASH" != "$MODEL_HASH" ]]; then
+            fail "model SHA256 mismatch: expected $EXPECT_HASH got $MODEL_HASH"
+            exit 1
+        fi
+
+        PROMPT_HASH=$(sha256_of_string "$PROMPT")
+
+        # Smoke test: bounded generation. Output goes to stderr by default in
+        # llama-cli; we discard both streams and rely on exit code.
+        if ! "$LLAMA_BIN" -m "$MODEL_PATH" -p "$PROMPT" -n "$MAX_TOKENS" \
+                --no-display-prompt --log-disable >/dev/null 2>&1; then
+            fail "llama-cli smoke test exited non-zero"
+            exit 1
+        fi
+
+        if [[ $JSON -eq 1 ]]; then
+            emit_json "ok" "local" "$LLAMA_BIN" "$MODEL_PATH" "$PROMPT_HASH" "$MODEL_HASH" ""
+        else
+            log "local OK: bin=$LLAMA_BIN model=$MODEL_PATH model_hash=$MODEL_HASH"
+        fi
+        exit 0
+        ;;
+    *)
+        fail "unknown --mode=$MODE (expected stub or local)"
+        exit 2
+        ;;
+esac

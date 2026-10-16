@@ -1,0 +1,72 @@
+# Extension build artifacts
+*.o
+*.so
+*.bc
+src/*.o
+src/*.bc
+
+# pg_regress output
+results/
+regression.diffs
+regression.out
+log/
+tmp_check/
+tmp_check_iso/
+output_iso/
+
+# mc2dbd listener build artifacts
+mc2dbd/build/
+mc2dbd/maludb_mc2dbd
+
+# dpkg-buildpackage staging (debian/tmp + per-package trees + bookkeeping)
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.debhelper.log
+debian/*.debhelper
+debian/*.substvars
+debian/maludb-mc2dbd/
+debian/postgresql-17-maludb-core/
+debian/tmp/
+
+# Claude Code local settings
+.claude/
+
+# Python build artefacts inside any service / CLI tree
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Claude session logs that the harness writes per-cwd
+**/docs/claude-log/
+# Internal session / process artifacts — never commit these publicly
+# (NOTE: gitignore patterns must not be indented — leading whitespace is
+# matched literally, which silently disabled this whole block before.)
+I-AM-DONE-HERE-*.md
+*-status.md
+20[0-9][0-9][0-9][0-9][0-9][0-9]-*.md
+AGENTS.md
+CLAUDE.md
+.codex/
+.cursor/
+
+# Tester-machine state
+fieldtest-*.log
+*.dump
+*.sql.gz
+core
+core.*
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.*.swp
+*.swp
+
+# Local environment files
+.env
+.env.*
+!.env.example
+

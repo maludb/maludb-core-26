@@ -1,0 +1,206 @@
+-- V3-STOR-01 — verbatim source archive regression coverage.
+--
+-- Exercises: register_storage_adapter / source_object_register /
+-- source_object_lookup_by_hash / source_object_set_legal_hold /
+-- source_object_add_reference / source_object_metadata /
+-- source_object_promote_to_source_package / audit.
+SET search_path TO maludb_core, public;
+-- ---------------------------------------------------------------------
+-- Test 1: register a local_fs adapter and an s3 adapter (S3 row
+-- exists for forward-compat; the CLI/restd-side resolver lands in a
+-- Stage 12 follow-up).
+-- ---------------------------------------------------------------------
+SELECT register_storage_adapter(
+    'local_smoke',
+    'local_fs',
+    jsonb_build_object('base_path','/var/lib/maludb/source-archive'),
+    NULL,
+    'V3-STOR-01 local smoke') AS adapter_id \gset a_
+SELECT register_storage_adapter(
+    's3_smoke',
+    's3',
+    jsonb_build_object('bucket','maludb-archive','region','us-east-1','key_prefix','smoke/'),
+    NULL,
+    'V3-STOR-01 s3 smoke (catalog only)') AS s3_adapter_id \gset a_
+SELECT :'a_adapter_id'::bigint > 0     AS local_assigned,
+       :'a_s3_adapter_id'::bigint > 0  AS s3_assigned;
+ local_assigned | s3_assigned 
+----------------+-------------
+ t              | t
+(1 row)
+
+-- local_fs config must include base_path; missing → check_violation.
+DO $body$
+BEGIN
+    PERFORM register_storage_adapter('bad_local','local_fs','{}'::jsonb,NULL,NULL);
+    RAISE EXCEPTION 'bad local_fs adapter was accepted (test 1 fail)';
+EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'register_storage_adapter rejects local_fs missing base_path';
+END;
+$body$;
+NOTICE:  register_storage_adapter rejects local_fs missing base_path
+-- ---------------------------------------------------------------------
+-- Test 2: register a source object. Re-registering the same hash
+-- returns the existing object_id (immutable archive semantics).
+-- ---------------------------------------------------------------------
+SELECT source_object_register(
+    'local_smoke',
+    'ab/cd/abcdef0123',
+    public.digest('hello-source-bytes'::bytea, 'sha256'),
+    18::bigint,
+    'text/plain',
+    NULL,
+    'standard',
+    'internal',
+    'smoke-partition') AS object_id \gset o_
+SELECT :'o_object_id'::bigint > 0 AS first_register;
+ first_register 
+----------------
+ t
+(1 row)
+
+SELECT source_object_register(
+    'local_smoke',
+    'ab/cd/abcdef0123',
+    public.digest('hello-source-bytes'::bytea, 'sha256'),
+    18::bigint,
+    'text/plain') = :'o_object_id'::bigint AS dedup_returns_existing;
+ dedup_returns_existing 
+------------------------
+ t
+(1 row)
+
+SELECT source_object_lookup_by_hash(public.digest('hello-source-bytes'::bytea, 'sha256'))
+       = :'o_object_id'::bigint AS lookup_by_hash;
+ lookup_by_hash 
+----------------
+ t
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 3: object metadata round-trip.
+-- ---------------------------------------------------------------------
+SELECT object_id, byte_length, media_type, retention_class, sensitivity,
+       partition, adapter_name, adapter_kind, legal_hold
+FROM source_object_metadata(:'o_object_id'::bigint);
+ object_id | byte_length | media_type | retention_class | sensitivity |    partition    | adapter_name | adapter_kind | legal_hold 
+-----------+-------------+------------+-----------------+-------------+-----------------+--------------+--------------+------------
+         1 |          18 | text/plain | standard        | internal    | smoke-partition | local_smoke  | local_fs     | f
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 4: legal hold on / off.
+-- ---------------------------------------------------------------------
+SELECT source_object_set_legal_hold(:'o_object_id'::bigint, true, 'litigation x')
+    AS prior_state_was_held;
+ prior_state_was_held 
+----------------------
+ f
+(1 row)
+
+SELECT m.legal_hold, o.legal_hold_reason
+FROM source_object_metadata(:'o_object_id'::bigint) m
+JOIN malu$source_object o ON o.object_id = m.object_id;
+ legal_hold | legal_hold_reason 
+------------+-------------------
+ t          | litigation x
+(1 row)
+
+SELECT source_object_set_legal_hold(:'o_object_id'::bigint, false) AS hold_released_from;
+ hold_released_from 
+--------------------
+ t
+(1 row)
+
+SELECT legal_hold FROM malu$source_object WHERE object_id = :'o_object_id'::bigint;
+ legal_hold 
+------------
+ f
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 5: object references — anchor a byte_range + page citation.
+-- ---------------------------------------------------------------------
+SELECT source_object_add_reference(
+    :'o_object_id'::bigint,
+    'byte_range',
+    jsonb_build_object('start', 0, 'end', 5)) AS byte_ref_id \gset r_
+SELECT source_object_add_reference(
+    :'o_object_id'::bigint,
+    'page',
+    jsonb_build_object('page', 1)) AS page_ref_id \gset r_
+SELECT kind, value_jsonb
+FROM malu$source_object_reference
+WHERE object_id = :'o_object_id'::bigint
+ORDER BY reference_id;
+    kind    |      value_jsonb       
+------------+------------------------
+ byte_range | {"end": 5, "start": 0}
+ page       | {"page": 1}
+(2 rows)
+
+-- ---------------------------------------------------------------------
+-- Test 6: promotion to malu$source_package + Derivation Ledger entry.
+-- ---------------------------------------------------------------------
+INSERT INTO malu$source_type(source_type, stage, description)
+VALUES ('smoke_source', 2, 'V3-STOR-01 smoke source_type')
+ON CONFLICT DO NOTHING;
+SELECT source_object_promote_to_source_package(
+    :'o_object_id'::bigint,
+    'smoke_source',
+    NULL,                                    -- content_bytes
+    'hello-source-bytes',                    -- content_text
+    NULL,                                    -- content_jsonb
+    jsonb_build_object('producer','pg_regress'),
+    NULL) AS source_package_id \gset p_
+SELECT source_type, retention_class, sensitivity,
+       origin_jsonb ->> 'source_object_id' = :'o_object_id'::text AS origin_has_object_id,
+       origin_jsonb ->> 'adapter'          = 'local_smoke'        AS origin_has_adapter
+FROM malu$source_package
+WHERE source_package_id = :'p_source_package_id'::bigint;
+ source_type  | retention_class | sensitivity | origin_has_object_id | origin_has_adapter 
+--------------+-----------------+-------------+----------------------+--------------------
+ smoke_source | standard        | internal    | t                    | t
+(1 row)
+
+-- Derivation ledger entry must exist for the promoted package.
+SELECT derived_object_type, parser_name,
+       inputs_jsonb -> 0 ->> 'kind'      = 'source_object'      AS ledger_input_kind,
+       inputs_jsonb -> 0 ->> 'object_id' = :'o_object_id'::text AS ledger_input_object_id
+FROM malu$derivation_ledger
+WHERE derived_object_type = 'source_package'
+  AND derived_object_id   = :'p_source_package_id'::bigint;
+ derived_object_type |      parser_name      | ledger_input_kind | ledger_input_object_id 
+---------------------+-----------------------+-------------------+------------------------
+ source_package      | source_object_promote | t                 | t
+(1 row)
+
+-- ---------------------------------------------------------------------
+-- Test 7: audit_event coverage.
+-- ---------------------------------------------------------------------
+SELECT event_kind, count(*) AS n
+FROM malu$audit_event
+WHERE event_kind LIKE 'storage_%'
+   OR event_kind LIKE 'source_object_%'
+GROUP BY event_kind
+ORDER BY event_kind;
+          event_kind          | n 
+------------------------------+---
+ source_object_legal_hold_off | 1
+ source_object_legal_hold_on  | 1
+ source_object_promote        | 1
+ source_object_register       | 1
+ storage_adapter_register     | 2
+(5 rows)
+
+-- ---------------------------------------------------------------------
+-- Cleanup.
+-- ---------------------------------------------------------------------
+DELETE FROM malu$derivation_ledger WHERE derived_object_id = :'p_source_package_id'::bigint AND derived_object_type='source_package';
+DELETE FROM malu$source_package    WHERE source_package_id = :'p_source_package_id'::bigint;
+DELETE FROM malu$source_type       WHERE source_type = 'smoke_source';
+DELETE FROM malu$source_object_reference WHERE object_id = :'o_object_id'::bigint;
+DELETE FROM malu$source_object           WHERE object_id = :'o_object_id'::bigint;
+DELETE FROM malu$storage_adapter
+WHERE adapter_id IN (:'a_adapter_id'::bigint, :'a_s3_adapter_id'::bigint);
+DELETE FROM malu$audit_event WHERE event_kind LIKE 'storage_%' OR event_kind LIKE 'source_object_%';

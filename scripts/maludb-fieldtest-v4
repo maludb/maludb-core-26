@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""V4 field-test orchestration.
+
+Walks every shipped V4 surface end-to-end against an installed
+MaluDB host (default DB: contrib_regression). Designed to be run
+AFTER pg_regress + service smoke + CLI smoke have all gone green
+— a failure here is a structural regression, not a wiring bug in
+one piece.
+
+Coverage mirrors the V4 plan's Stage 16..19 + alpha.5..beta.1
+external surfaces. The catalog-level scenarios run live SQL; the
+MC2DB / REST / CLI / SDK scenarios assert the catalog
+registrations exist (the live services would be exercised by
+their own smoke harnesses, which v4 field-test rolls up at the
+end).
+
+Usage:
+    scripts/maludb-fieldtest-v4
+    MALUDB_FT_DB=maludb scripts/maludb-fieldtest-v4
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+
+import psycopg
+
+
+DB     = os.environ.get("MALUDB_FT_DB", "contrib_regression")
+HOST   = os.environ.get("MALUDB_FT_HOST")
+PORT   = os.environ.get("MALUDB_FT_PORT")
+USER   = os.environ.get("MALUDB_FT_USER")
+PASS   = os.environ.get("MALUDB_FT_PASS")
+
+TAG = f"v4ft-{int(time.time())}"
+
+
+PASS_COUNT = 0
+FAIL_COUNT = 0
+RESULTS: list[dict] = []
+# Stream for the human-readable progress lines. main() redirects
+# this to stderr when --json is set so the captured stdout stays
+# clean JSON.
+LOG_STREAM = sys.stdout
+
+
+def _check(name: str, cond: bool, detail: str = "") -> None:
+    global PASS_COUNT, FAIL_COUNT
+    status = "PASS" if cond else "FAIL"
+    if cond:
+        PASS_COUNT += 1
+    else:
+        FAIL_COUNT += 1
+    print(f"  [{status}] {name}" + (f"  -- {detail}" if detail else ""),
+          file=LOG_STREAM)
+    RESULTS.append({"name": name, "status": status, "detail": detail})
+
+
+def _dsn() -> str:
+    parts = [f"dbname={DB}"]
+    if HOST: parts.append(f"host={HOST}")
+    if PORT: parts.append(f"port={PORT}")
+    if USER: parts.append(f"user={USER}")
+    if PASS: parts.append(f"password={PASS}")
+    return " ".join(parts)
+
+
+@contextmanager
+def conn():
+    c = psycopg.connect(_dsn(), autocommit=True)
+    try:
+        with c.cursor() as cur:
+            cur.execute("SET search_path TO maludb_core, public")
+        yield c
+    finally:
+        c.close()
+
+
+def _section(title: str) -> None:
+    print(f"\n=== {title} ===", file=LOG_STREAM)
+
+
+# =====================================================================
+# Scenarios
+# =====================================================================
+
+def stage_16_doc_consistency() -> None:
+    _section("Stage 16 (V4-DOC-01) — doc consistency gate")
+    rc = os.system(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "maludb-check-doc-consistency") + " > /tmp/v4ft-doc.out 2>&1")
+    detail = open("/tmp/v4ft-doc.out").read().strip()
+    _check("doc-consistency script returns 0", rc == 0, detail if rc else "")
+    _check("doc mentions PageIndex / Version 4",
+           "Version 4" in detail or "PageIndex" in detail
+           or "v4.0.0" in detail,
+           "scanned doc-consistency output")
+
+
+def stage_17_pageindex_catalog() -> int:
+    _section("Stage 17 (V4-PAGEINDEX-01) — tree catalog + status transitions")
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT register_source_package('document', NULL, %s, NULL, %s)",
+            (f"{TAG}: page index fieldtest doc", "text/plain"))
+        sp_id = cur.fetchone()[0]
+        _check("register_source_package returns id > 0", sp_id > 0)
+
+        cur.execute("SELECT page_index_tree_register(%s, 'pdf')", (sp_id,))
+        tree_id = cur.fetchone()[0]
+        _check("page_index_tree_register returns id > 0", tree_id > 0,
+               f"tree_id={tree_id}")
+
+        cur.execute("SELECT build_status FROM malu$page_index_tree "
+                    "WHERE tree_id = %s", (tree_id,))
+        _check("tree is in 'pending' status", cur.fetchone()[0] == "pending")
+
+        cur.execute("SELECT page_index_tree_mark_building(%s)", (tree_id,))
+        cur.execute("SELECT page_index_tree_mark_ready(%s)", (tree_id,))
+        cur.execute("SELECT build_status FROM malu$page_index_tree "
+                    "WHERE tree_id = %s", (tree_id,))
+        _check("tree advances to 'ready'", cur.fetchone()[0] == "ready")
+
+        cur.execute(
+            "SELECT count(*) FROM malu$audit_event "
+            "WHERE event_kind LIKE %s "
+            "  AND target_object_id = %s",
+            ("page_index_tree.%", tree_id))
+        _check("audit rows recorded for tree transitions",
+               cur.fetchone()[0] >= 3)
+        return sp_id
+
+
+def stage_17_promote(sp_id: int) -> int:
+    _section("Stage 17 (V4-PAGEINDEX-02) — promotion path + queue + audit")
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT source_package_promote_to_page_index(%s, 'pdf')",
+            (sp_id,))
+        tree_id = cur.fetchone()[0]
+        _check("source_package_promote_to_page_index returns tree id",
+               tree_id > 0, f"tree_id={tree_id}")
+
+        cur.execute(
+            "SELECT count(*) FROM malu$queue_job j "
+            "JOIN malu$queue q ON q.queue_id = j.queue_id "
+            "WHERE q.name = 'pageindex_build' "
+            "  AND j.payload->>'tree_id' = %s::text", (tree_id,))
+        _check("pageindex_build queue job enqueued",
+               cur.fetchone()[0] >= 1)
+
+        # Simulate a builder writing the structure-pass + nodes.
+        cur.execute("SELECT page_index_tree_mark_building(%s)", (tree_id,))
+        cur.execute(
+            "SELECT page_index_record_structure_pass(%s, 'pdf', 'pypdf-4.0', 3, 2, %s)",
+            (tree_id, f"hash-{TAG}"))
+        audit_id = cur.fetchone()[0]
+        _check("page_index_record_structure_pass writes audit row", audit_id > 0)
+
+        cur.execute(
+            "SELECT mdo_id, derivation_id FROM page_index_record_node("
+            "  %s, NULL, 'internal', 'Root', 'Root summary.',"
+            "  NULL, NULL, NULL, NULL, NULL)",
+            (tree_id,))
+        root_mdo, root_deriv = cur.fetchone()
+        _check("page_index_record_node returns mdo + derivation",
+               root_mdo > 0 and root_deriv > 0,
+               f"mdo={root_mdo} deriv={root_deriv}")
+
+        cur.execute(
+            "SELECT mdo_id FROM page_index_record_node("
+            "  %s, %s, 'leaf', 'Methods',"
+            "  'Methods covering gamma delta epsilon procedures.',"
+            "  NULL, NULL, NULL, NULL, NULL)",
+            (tree_id, root_mdo))
+        leaf_methods = cur.fetchone()[0]
+
+        cur.execute(
+            "SELECT mdo_id FROM page_index_record_node("
+            "  %s, %s, 'leaf', 'Results',"
+            "  'Results outcome.',"
+            "  NULL, NULL, NULL, NULL, NULL)",
+            (tree_id, root_mdo))
+        leaf_results = cur.fetchone()[0]
+
+        cur.execute("SELECT page_index_tree_mark_ready(%s)", (tree_id,))
+
+        cur.execute(
+            "SELECT count(*) FROM malu$derivation_ledger "
+            "WHERE derived_object_type = 'page_index_node' "
+            "  AND derived_object_id IN (%s, %s, %s)",
+            (root_mdo, leaf_methods, leaf_results))
+        _check("ledger entries for every recorded node",
+               cur.fetchone()[0] == 3)
+        return tree_id
+
+
+def stage_18_descent(tree_id: int) -> None:
+    _section("Stage 18 (V4-PAGEINDEX-03) — retrieval planner descent")
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT envelope_id, leaf_title, depth_reached "
+            "FROM retrieve_with_envelope_tree(%s, %s)",
+            ("gamma delta", tree_id))
+        row = cur.fetchone()
+        _check("retrieve_with_envelope_tree returns a hit",
+               row is not None)
+        env_id, leaf_title, depth = row
+        _check("descent lands on the 'Methods' leaf",
+               leaf_title == "Methods",
+               f"leaf_title={leaf_title!r} depth={depth}")
+
+        cur.execute(
+            "SELECT count(*) FROM malu$retrieval_decision_audit "
+            "WHERE envelope_id = %s AND stage = 'tree_descent'", (env_id,))
+        _check("tree_descent decision_audit rows recorded",
+               cur.fetchone()[0] >= 2)
+
+        cur.execute(
+            "SELECT tree_descent_used, "
+            "       jsonb_array_length(tree_descent_path) AS steps "
+            "FROM malu$retrieval_envelope WHERE envelope_id = %s",
+            (env_id,))
+        used, steps = cur.fetchone()
+        _check("envelope captured tree_descent_path",
+               used and steps >= 2,
+               f"used={used} steps={steps}")
+
+        cur.execute(
+            "SELECT count(*) FROM malu$derivation_ledger "
+            "WHERE derived_object_type = 'retrieval_summary' "
+            "  AND (inputs_jsonb->>'envelope_id')::bigint = %s",
+            (env_id,))
+        _check("retrieval_summary ledger entries recorded",
+               cur.fetchone()[0] >= 1)
+
+
+def stage_19_chat(sp_id: int) -> int:
+    _section("Stage 19 (V4-CHATINDEX-01 + 02) — chat catalog + append")
+    with conn() as c, c.cursor() as cur:
+        cur.execute("SELECT chat_index_tree_register(%s)", (sp_id,))
+        chat_id = cur.fetchone()[0]
+        _check("chat_index_tree_register returns id > 0", chat_id > 0,
+               f"chat_tree_id={chat_id}")
+
+        cur.execute("SELECT chat_index_tree_mark_building(%s)", (chat_id,))
+        cur.execute("SELECT chat_index_tree_mark_ready(%s)", (chat_id,))
+
+        # First append: auto-opens root topic + lands a message.
+        cur.execute(
+            "SELECT message_index FROM chat_index_append_messages(%s, %s::jsonb)",
+            (chat_id, json.dumps([
+                {"message_index": 0, "user_message": "first user"},
+                {"message_index": 1, "user_message": "second user"}])))
+        msgs = [r[0] for r in cur.fetchall()]
+        _check("append returns one row per message", msgs == [0, 1])
+
+        cur.execute(
+            "SELECT opened_new_topic, appended_message_count, idempotent_hits "
+            "FROM malu$chat_index_append_audit "
+            "WHERE tree_id = %s ORDER BY append_id DESC LIMIT 1",
+            (chat_id,))
+        opened, appended, idem = cur.fetchone()
+        _check("first-append audit: opened_new_topic=true",
+               opened and appended == 2 and idem == 0)
+
+        # Branch from current.
+        cur.execute(
+            "SELECT message_index FROM chat_index_append_messages(%s, %s::jsonb)",
+            (chat_id, json.dumps([{
+                "message_index": 2,
+                "user_message": "pivot",
+                "topic_branch": {"new": "Side"}}])))
+        cur.execute(
+            "SELECT opened_new_topic, ancestor_branch_used "
+            "FROM malu$chat_index_append_audit "
+            "WHERE tree_id = %s ORDER BY append_id DESC LIMIT 1",
+            (chat_id,))
+        opened, anc = cur.fetchone()
+        _check("branch-from-current: opened_new_topic=true, ancestor=false",
+               opened and not anc)
+
+        # Idempotency check: re-append message_index=0.
+        cur.execute(
+            "SELECT idempotent_hit FROM chat_index_append_messages(%s, %s::jsonb)",
+            (chat_id, json.dumps([{
+                "message_index": 0, "user_message": "duplicate"}])))
+        hit = cur.fetchone()[0]
+        _check("duplicate message_index returns idempotent_hit=true", hit)
+
+        # Chat descent.
+        cur.execute(
+            "SELECT leaf_mdo_id, depth_reached "
+            "FROM retrieve_with_envelope_chat_tree(%s, %s)",
+            ("first user", chat_id))
+        row = cur.fetchone()
+        _check("retrieve_with_envelope_chat_tree returns hit",
+               row is not None and row[0] > 0)
+        return chat_id
+
+
+def stage_mc2db_alpha5() -> None:
+    _section("alpha.5 (V4-MC2DB-01) — full V4 MC2DB tool surface")
+    expected_tools = {
+        "maludb.pageindex.build",
+        "maludb.pageindex.list",
+        "maludb.pageindex.ask",
+        "maludb.pageindex.tree_summary",
+        "maludb.chatindex.build",
+        "maludb.chatindex.append",
+        "maludb.chatindex.ask",
+        "maludb.chatindex.list",
+    }
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT tool_name FROM malu$mc2db_tool t "
+            "JOIN malu$mc2db_server s ON s.server_id = t.server_id "
+            "WHERE s.server_name = 'maludb.advanced' "
+            "  AND (tool_name LIKE %s OR tool_name LIKE %s)",
+            ("maludb.pageindex.%", "maludb.chatindex.%"))
+        present = {row[0] for row in cur.fetchall()}
+        missing = expected_tools - present
+        _check("all 8 V4 MC2DB tools registered on maludb.advanced",
+               not missing, f"missing={sorted(missing)}" if missing else "")
+
+
+def stage_rest_alpha6() -> None:
+    _section("alpha.6 (V4-REST-01) — V4 REST endpoint surface")
+    expected_paths = {
+        ("POST", "/v4/pageindex/build"),
+        ("GET",  "/v4/pageindex/trees"),
+        ("GET",  "/v4/pageindex/trees/:tree_id"),
+        ("POST", "/v4/pageindex/ask"),
+        ("POST", "/v4/chatindex/build"),
+        ("POST", "/v4/chatindex/append"),
+        ("GET",  "/v4/chatindex/trees"),
+        ("POST", "/v4/chatindex/ask"),
+    }
+    with conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT method, path FROM malu$rest_endpoint "
+            "WHERE path LIKE %s AND enabled", ("/v4/%",))
+        present = {(row[0], row[1]) for row in cur.fetchall()}
+        missing = expected_paths - present
+        _check("all 8 V4 REST endpoints registered",
+               not missing, f"missing={sorted(missing)}" if missing else "")
+
+
+def stage_cli_beta1() -> None:
+    _section("beta.1 (V4-CLI-01) — CLI subcommand wiring")
+    # We don't fork the CLI binary; verify the python modules load
+    # and expose 'register' callables.
+    try:
+        sys.path.insert(0,
+            "/home/maludb/maludb-core/cli/maludb/src")
+        from maludb_cli.commands import pageindex, chatindex  # noqa: F401
+        _check("maludb_cli.commands.pageindex importable",
+               callable(getattr(pageindex, "register", None)))
+        _check("maludb_cli.commands.chatindex importable",
+               callable(getattr(chatindex, "register", None)))
+    except Exception as e:                                       # noqa: BLE001
+        _check("CLI modules import OK", False, f"raised: {e}")
+
+
+def stage_sdk_beta1() -> None:
+    _section("beta.1 (V4-SDK-01) — Python SDK V4 surface")
+    try:
+        sys.path.insert(0,
+            "/home/maludb/maludb-core/drivers/python/src")
+        from maludb import MaluDBClient
+        v4_methods = {
+            "pageindex_build", "pageindex_list", "pageindex_get",
+            "pageindex_ask", "pageindex_supersede",
+            "chatindex_build", "chatindex_append",
+            "chatindex_list", "chatindex_ask",
+        }
+        missing = {m for m in v4_methods
+                   if not callable(getattr(MaluDBClient, m, None))}
+        _check("MaluDBClient exposes all 9 V4 methods", not missing,
+               f"missing={sorted(missing)}" if missing else "")
+    except Exception as e:                                       # noqa: BLE001
+        _check("Python SDK imports OK", False, f"raised: {e}")
+
+
+def teardown(tree_id: int, chat_id: int) -> None:
+    _section("teardown")
+    with conn() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM malu$page_index_tree WHERE tree_id = %s",
+                    (tree_id,))
+        cur.execute("DELETE FROM malu$chat_index_tree WHERE tree_id = %s",
+                    (chat_id,))
+        cur.execute(
+            "DELETE FROM malu$source_package "
+            "WHERE content_text LIKE %s", (f"{TAG}%",))
+        cur.execute(
+            "DELETE FROM malu$audit_event "
+            "WHERE event_kind LIKE %s OR event_kind LIKE %s",
+            ("page_index_tree.%", "chat_index_tree.%"))
+    print("  cleaned fieldtest rows", file=LOG_STREAM)
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(prog="maludb-fieldtest-v4")
+    parser.add_argument("--json", action="store_true",
+        help="Emit a machine-readable JSON summary on stdout instead of text.")
+    args = parser.parse_args()
+
+    global LOG_STREAM
+    if args.json:
+        # Keep stdout clean for the JSON dump; progress goes to stderr.
+        LOG_STREAM = sys.stderr
+    else:
+        print(f"V4 field-test starting (DB={DB}, tag={TAG})")
+
+    stage_16_doc_consistency()
+    sp_id   = stage_17_pageindex_catalog()
+    tree_id = stage_17_promote(sp_id)
+    stage_18_descent(tree_id)
+    chat_id = stage_19_chat(sp_id)
+    stage_mc2db_alpha5()
+    stage_rest_alpha6()
+    stage_cli_beta1()
+    stage_sdk_beta1()
+    teardown(tree_id, chat_id)
+
+    if args.json:
+        print(json.dumps({
+            "tag": TAG,
+            "pass": PASS_COUNT,
+            "fail": FAIL_COUNT,
+            "results": RESULTS,
+        }, indent=2))
+    else:
+        print(f"\n--- V4 field-test summary ---")
+        print(f"PASS={PASS_COUNT}  FAIL={FAIL_COUNT}")
+        if FAIL_COUNT:
+            print("\nFAIL detail:")
+            for r in RESULTS:
+                if r["status"] == "FAIL":
+                    print(f"  - {r['name']}: {r['detail']}")
+        else:
+            print("V4 field-test: GREEN")
+    return 1 if FAIL_COUNT else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

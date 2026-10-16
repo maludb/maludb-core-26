@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maludb-cli"
+version = "0.1.0"
+description = "MaluDB first-party CLI (V3-CLI-01) — operates the memory DBMS through the stable SQL/HTTP/MC2DB APIs."
+readme = "README.md"
+license = { text = "PostgreSQL" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Edward Honour", email = "ed@maludb.org" }
+]
+keywords = ["maludb", "cli", "postgres", "memory", "operator"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: PostgreSQL License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: System :: Systems Administration",
+]
+
+dependencies = [
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+]
+
+[project.scripts]
+maludb = "maludb_cli.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maludb_cli"]

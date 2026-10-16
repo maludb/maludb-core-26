@@ -1,0 +1,131 @@
+maludb (0.96.0-1) noble; urgency=medium
+
+  * v4.4.0 release. Extension default_version 0.96.0; 89/89 pg_regress
+    on PostgreSQL 17; fresh-install ≡ 0.1.0→0.96.0 upgrade verified via
+    the catalog snapshot gate.
+  * Event kinds become first-class subject types (0.96.0): the SVPOR
+    subject-type catalog gains an entity/event category and seeds the
+    common event kinds (deployment, incident, daily_standup, …) with
+    curated descriptions; the generic event type and prior auto-
+    registered kinds move to category=event; project stays entity-only.
+    Extraction JSON contract unchanged.
+  * API prompt is now catalog-driven: docs/extraction-prompt-0.96.0.md
+    renders the entity-type and event-kind lists (with descriptions)
+    from maludb_subject_type, superseding the hardcoded gpt-4o prompt.
+  * Quickstart fix: drop the redundant manual createdb/CREATE EXTENSION
+    steps (maludb-bootstrap already does both for the default database);
+    they are now the explicit custom/existing-database branch.
+
+ -- Edward Honour <ed@maludb.org>  Tue, 09 Jun 2026 00:00:00 +0000
+
+maludb (0.95.0-1) noble; urgency=medium
+
+  * v4.3.0 release. Extension default_version 0.95.0;
+    89/89 pg_regress on PostgreSQL 17.
+  * Semantic spine (0.95.0): subjects/verbs/edges become the vector
+    layer — deterministic in-DB entity cards + trigger-fed dirty
+    queue + external embed worker landing in the object-embedding
+    rail; materialized similar_to traversal jumps (opt-in via
+    rel_filter); unified edge view gains the ingested subject
+    relationships (gap fix); statement source_spans[] accretion.
+    Chunk-compartment rail frozen/deprecated; extraction JSON
+    contract unchanged.
+  * Episodes as subjects (0.94.0): every episode is a typed event
+    subject with the temporal body as a sidecar; BREAKING ingest
+    contract (episodes[] removed — events are subjects[] entries
+    with occurred_at).
+  * Refreshed the postgresql-17-maludb-core package description (was
+    stuck at the 0.40.0 feature list); declare the intentionally-
+    unshipped staged mc2dbd unit in debian/not-installed so dh_missing
+    passes.
+
+ -- Edward Honour <ed@maludb.org>  Sun, 07 Jun 2026 00:00:00 +0000
+
+maludb (0.93.0-1) noble; urgency=medium
+
+  * v4.2.0 release. Extension default_version 0.93.0;
+    87/87 pg_regress on PostgreSQL 17.
+  * Memory model: typed subjects/verbs, episodes + SVPO statements,
+    polymorphic attributes + templates, bundled object reads
+    (0.75.0–0.87.0).
+  * Graph-bound vector compartments + memory ingest/search (0.88.0);
+    in-database per-tenant model gateway (0.89.0/0.91.0);
+    relational↔graph external-link helpers (0.90.0); one-call memory
+    ingestion from an extraction JSON object (0.92.0).
+  * 0.93.0 repairs the malu$derivation_ledger derived_object_type
+    CHECK that the 0.82.0 migration narrowed, restoring PageIndex
+    retrieval-summary and ChatIndex topic/message writes.
+
+ -- Edward Honour <ed@maludb.org>  Sat, 06 Jun 2026 00:00:00 +0000
+
+maludb (0.71.0-1) noble; urgency=medium
+
+  * v4.0.0 GA package metadata. Extension default_version 0.71.0;
+    74/74 pg_regress on PostgreSQL 17.
+  * Ship V4 PageIndex / ChatIndex SQL, MC2DB, REST, CLI, and SDK
+    surfaces with the 0.71.0 extension script set.
+
+ -- Edward Honour <ed@maludb.org>  Fri, 15 May 2026 00:00:00 +0000
+
+maludb (0.41.0-1) noble; urgency=medium
+
+  * v2.0.0-alpha.1 point release. Extension 0.41.0; 51/51 pg_regress.
+  * S7-2.a — owner_schema + RLS on malu$mc2db_invocation (closes
+    docs/security-review.md finding #2).
+  * S7-2.c — scripts/maludb-bootstrap now preloads pgaudit and sets
+    pgaudit.log via pg_conftool; scripts/maludb-validate confirms
+    (closes finding #3).
+  * Python driver SDK landed under drivers/python/ (not in the .deb).
+
+ -- Edward Honour <ed@maludb.org>  Wed, 13 May 2026 11:50:00 +0000
+
+maludb (0.40.0-1) noble; urgency=medium
+
+  * v1.6.0 release surface. Extension upgrade chain
+    0.1.0 → 0.2.0 → … → 0.40.0 (40 migration steps).
+  * Stages 2..6 in-DB feature set landed:
+    - Stage 2 memory object model + derivation ledger.
+    - Stage 3 bitemporal + supersession + SVPOR + MAUT + lifecycle.
+    - Stage 4 retrieval planner + FTS/graph/hints + 3-stage authz.
+    - Stage 5 workflow extraction + skill runtime + active pools +
+      episode replay.
+    - Stage 6 local-node sync + model registry blue-green +
+      adapter alignment + advanced MC2DB tools.
+  * Stage 7 hardening underway: benchmark baseline, security review,
+    getting-started + admin docs + four end-to-end examples.
+  * 50/50 pg_regress tests pass on PG 17.
+
+ -- Edward Honour <ed@maludb.org>  Wed, 13 May 2026 03:30:00 +0000
+
+maludb (0.4.0-1) noble; urgency=medium
+
+  * v1.0.0-rc1 release surface.  Extension upgrade chain
+    0.1.0 → 0.2.0 → 0.3.0 → 0.4.0.
+  * postgresql-17-maludb-core: R1.0 + selected R1.1 alphas.
+    - R1.1-2 mcp_proxy dispatcher catalog (listener wires it).
+    - R1.1-3 http_endpoint dispatcher schema (endpoint_url,
+      http_method, static_headers, auth_type/token columns).
+    - R1.1-7 LLM-role + row-level-security surface (six roles,
+      RLS on the eight LLM-tenancy tables, current_account_id()
+      GUC helper).
+    - R1.1-12/13/14 compartmentalized vector substrate, C top-K
+      heap, maludb.memory.search.exact MC2DB tool.
+  * maludb-mc2dbd: full four-dispatcher tool surface
+    (sql_function + external_exec + mcp_proxy + http_endpoint).
+    - Prometheus /metrics endpoint.
+    - 27 service tests green on a clean Ubuntu 24.04 VM.
+  * Build deps now include libcurl4-openssl-dev (for mcp_proxy +
+    http_endpoint) and libgnutls28-dev (TLS in the listener).
+
+ -- Edward Honour <ed@maludb.org>  Tue, 12 May 2026 21:30:00 +0000
+
+maludb (0.1.0-1) noble; urgency=medium
+
+  * Initial Debian/Ubuntu packaging — release candidate for v1.0.0-rc1.
+  * postgresql-17-maludb-core: MaluDB R1.0 + R1.1-12 + R1.1-13.
+    - Stage 1 schema, MC2DB tool registry, model gateway hooks.
+    - Compartmentalized vector substrate (BYTEA float32, top-K heap).
+  * maludb-mc2dbd: MC2DB listener with R1.1-1 external_exec dispatcher
+    and R1.1-14 maludb.memory.search.exact tool seeded.
+
+ -- Edward Honour <ed@maludb.org>  Wed, 06 May 2026 00:00:00 +0000

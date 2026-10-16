@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/maludb-bootstrap-test.XXXXXX")"
+trap 'rm -rf "$tmpdir"' EXIT
+
+stubdir="$tmpdir/bin"
+mkdir -p "$stubdir"
+
+cat >"$stubdir/id" <<'EOS'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-u" ]; then
+    echo 0
+    exit 0
+fi
+exit 0
+EOS
+
+cat >"$stubdir/dpkg" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+
+cat >"$stubdir/make" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+
+cat >"$stubdir/install" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+
+cat >"$stubdir/systemctl" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+
+cat >"$stubdir/getent" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+
+cat >"$stubdir/usermod" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+
+cat >"$stubdir/pg_conftool" <<'EOS'
+#!/usr/bin/env bash
+state="${MALUDB_BOOTSTRAP_TEST_STATE:?missing state file}"
+cmd="${3:-}"
+key="${4:-}"
+
+if [ "$cmd" = "show" ] && [ "$key" = "shared_preload_libraries" ]; then
+    if [ -s "$state" ]; then
+        printf "shared_preload_libraries = '%s'\n" "$(cat "$state")"
+        exit 0
+    fi
+    exit 1
+fi
+
+if [ "$cmd" = "show" ] && [ "$key" = "pgaudit.log" ]; then
+    printf "pgaudit.log = 'write, ddl, role'\n"
+    exit 0
+fi
+
+if [ "$cmd" = "set" ] && [ "$key" = "shared_preload_libraries" ]; then
+    printf "%s" "${5:-}" >"$state"
+    exit 0
+fi
+
+if [ "$cmd" = "set" ]; then
+    exit 0
+fi
+
+exit 2
+EOS
+
+cat >"$stubdir/sudo" <<'EOS'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-u" ] && [ "${2:-}" = "postgres" ]; then
+    shift 2
+    [ "${1:-}" = "--" ] && shift
+    if [ "${1:-}" = "psql" ]; then
+        case " $* " in
+            *" SHOW pgaudit.log "*) exit 0 ;;
+            *"SELECT 1 FROM pg_roles"*) exit 1 ;;
+            *) exit 42 ;;
+        esac
+    fi
+fi
+exit 42
+EOS
+
+chmod +x "$stubdir"/*
+
+state_file="$tmpdir/preload"
+output_file="$tmpdir/output"
+set +e
+PATH="$stubdir:$PATH" \
+MALUDB_BOOTSTRAP_TEST_STATE="$state_file" \
+MALUDB_FORCE_OS=1 \
+SUDO_USER= \
+    "$repo_root/scripts/maludb-bootstrap" >"$output_file" 2>&1
+rc=$?
+set -e
+
+if ! grep -q "==> Creating OS service users" "$output_file"; then
+    cat "$output_file"
+    echo "expected bootstrap to continue past pgaudit preload when shared_preload_libraries is unset" >&2
+    exit 1
+fi
+
+if ! grep -q "shared_preload_libraries" "$output_file"; then
+    cat "$output_file"
+    echo "expected bootstrap to configure shared_preload_libraries" >&2
+    exit 1
+fi
+
+if [ "$rc" -eq 0 ]; then
+    echo "expected stubbed bootstrap to stop before real database setup" >&2
+    exit 1
+fi
+
+echo "ok - bootstrap tolerates unset shared_preload_libraries"

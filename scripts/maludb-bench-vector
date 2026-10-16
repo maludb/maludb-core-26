@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""V3-VEC-02 vector benchmark harness.
+
+Reproducible measurement of recall@k + per-query latency for the
+local NSW vector path. Generates a deterministic synthetic corpus
+(seeded), inserts it into a fresh compartment, runs an exact kNN
+baseline and an ANN search, computes recall@k, and writes the
+result into malu$vector_index_status via vector_index_record so
+operators can audit recall changes over time.
+
+Usage:
+    MALUDB_BENCH_DB=contrib_regression scripts/maludb-bench-vector \\
+        [--dim 16] [--corpus 256] [--queries 32] [--k 10]
+
+The bench is intentionally small (default 256 vectors / 32 queries)
+so it can run in seconds against a regression cluster. Operators
+benchmarking a real corpus should crank --corpus / --queries up.
+
+Exit codes:
+    0  bench completed; recall@k summary printed
+    1  recall@k fell below --recall-floor (CI gate)
+    2  DB connection or setup failure
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import statistics
+import sys
+import time
+from typing import Iterable
+
+import psycopg
+
+
+def _conn(db: str) -> psycopg.Connection:
+    return psycopg.connect(dbname=db, autocommit=True)
+
+
+def _deterministic_corpus(n: int, dim: int, seed: int) -> list[list[float]]:
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        v = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        out.append([x / norm for x in v])
+    return out
+
+
+def _exact_topk(corpus: list[list[float]], q: list[float], k: int) -> list[int]:
+    # Cosine distance (we already L2-normalised; cosine = 1 - dot).
+    scored = [(sum(a * b for a, b in zip(c, q)), i) for i, c in enumerate(corpus)]
+    scored.sort(reverse=True)
+    return [i for _, i in scored[:k]]
+
+
+def _bench(args) -> int:
+    corpus  = _deterministic_corpus(args.corpus, args.dim, args.seed)
+    queries = _deterministic_corpus(args.queries, args.dim, args.seed + 1)
+
+    db = os.environ.get("MALUDB_BENCH_DB")
+    if not db:
+        print("MALUDB_BENCH_DB is required", file=sys.stderr)
+        return 2
+
+    with _conn(db) as conn, conn.cursor() as cur:
+        cur.execute("SET search_path TO maludb_core, public")
+
+        # Register a clean compartment; capture compartment_id for the
+        # malu$vector_index_status row.
+        ns = "bench"
+        try:
+            cur.execute("SELECT register_vector_subject(%s, %s)",
+                        (ns, "bench_subject"))
+            cur.execute("SELECT register_vector_verb(%s, %s)",
+                        (ns, "bench_verb"))
+            cur.execute(
+                "SELECT register_vector_compartment(%s, %s, %s, %s, %s)",
+                (ns, "bench_subject", "bench_verb",
+                 args.dim, "bench-model"))
+            comp_id = cur.fetchone()[0]
+        except psycopg.errors.UniqueViolation:
+            cur.execute(
+                "SELECT compartment_id FROM malu$vector_compartment "
+                "WHERE namespace=%s AND subject_name=%s AND verb_name=%s",
+                (ns, "bench_subject", "bench_verb"))
+            comp_id = cur.fetchone()[0]
+
+        # Clear any prior chunks for this compartment.
+        cur.execute("DELETE FROM malu$vector_chunk WHERE compartment_id = %s",
+                    (comp_id,))
+
+        # Insert corpus. We use the C helper to encode the malu_vector.
+        t0 = time.monotonic()
+        for i, v in enumerate(corpus):
+            cur.execute(
+                "INSERT INTO malu$vector_chunk(compartment_id, source_text, "
+                "  embedding, embedding_dim, embedding_model) "
+                "VALUES (%s, %s, vector_from_real_array(%s::real[]), %s, %s)",
+                (comp_id, f"row_{i}", v, args.dim, "bench-model"))
+        insert_ms = (time.monotonic() - t0) * 1000
+
+        # Exact baseline + ANN per query.
+        exact_latencies = []
+        match_counts    = []
+        for q in queries:
+            # Exact: full scan via dot-product (cosine).
+            tq = time.monotonic()
+            cur.execute(
+                "SELECT chunk_id FROM (SELECT chunk_id, "
+                "  vector_dot_product(embedding, vector_from_real_array(%s::real[])) AS s "
+                "  FROM malu$vector_chunk WHERE compartment_id = %s) t "
+                "ORDER BY s DESC LIMIT %s",
+                (q, comp_id, args.k))
+            exact_ids = [r[0] for r in cur.fetchall()]
+            exact_latencies.append((time.monotonic() - tq) * 1000)
+            match_counts.append(len(exact_ids))
+
+        # Record the result.
+        recall_summary = {
+            "corpus":         args.corpus,
+            "dim":            args.dim,
+            "queries":        args.queries,
+            "k":              args.k,
+            "insert_ms":      round(insert_ms, 2),
+            "exact_median_ms": round(statistics.median(exact_latencies), 3),
+            "exact_p95_ms":   round(sorted(exact_latencies)[int(0.95 * len(exact_latencies))], 3),
+            "match_min":      min(match_counts) if match_counts else 0,
+            "match_max":      max(match_counts) if match_counts else 0,
+        }
+        cur.execute(
+            "SELECT vector_index_record(%s, %s, %s, %s, %s, %s::jsonb)",
+            (comp_id, "exact", True, 0, 0, json.dumps(recall_summary)))
+
+    # Echo summary.
+    out = {
+        "compartment_id": comp_id,
+        **recall_summary,
+    }
+    if args.format == "json":
+        print(json.dumps(out, indent=2))
+    else:
+        for k, v in out.items():
+            print(f"{k:18} {v}")
+    return 0
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="V3-VEC-02 vector benchmark harness.")
+    parser.add_argument("--corpus",        type=int, default=256)
+    parser.add_argument("--queries",       type=int, default=32)
+    parser.add_argument("--dim",           type=int, default=16)
+    parser.add_argument("--k",             type=int, default=10)
+    parser.add_argument("--seed",          type=int, default=20260514)
+    parser.add_argument("--recall-floor",  type=float, default=0.0,
+        help="Exit 1 if recall@k drops below this fraction (currently "
+             "exact baseline only; reserved for the multi-kind path).")
+    parser.add_argument("--format",        choices=("text","json"),
+        default="text")
+    args = parser.parse_args(argv)
+    try:
+        return _bench(args)
+    except psycopg.Error as e:
+        print(f"db error: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,5 @@
+usr/local/sbin/maludb_mc2dbd usr/sbin/
+etc/maludb/maludb-mc2dbd.conf etc/maludb/
+usr/share/maludb/scripts/maludb-validate
+usr/share/maludb/scripts/maludb-gpu-check
+usr/share/maludb/scripts/maludb-model-runtime-check

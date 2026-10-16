@@ -1,0 +1,41 @@
+# /etc/maludb/maludb-modeld.conf — model gateway daemon config (R1.0-9)
+#
+# Sourced by maludb-modeld.service. The gateway polls
+# malu$model_request for status='pending' rows and dispatches them to
+# the configured runtime. R1.0 supports local_runtime via llama-cli;
+# cloud_api adapters are deferred. stub providers are handled
+# synchronously by the listener and the daemon ignores them.
+
+# libpq connection string. The gateway daemon's systemd unit runs as
+# OS user maludb_modeld; with peer auth the PG role name must match.
+# Bootstrap creates this PG role with SELECT/UPDATE on malu$model_request
+# and INSERT on malu$model_response.
+PG_CONNINFO="host=/var/run/postgresql user=maludb_modeld dbname=maludb"
+
+# Polling interval (seconds). Lower for low-latency dev; higher to
+# reduce DB load.
+POLL_INTERVAL=5
+
+# Path to the llama.cpp llama-cli binary. The R1.0-2 vendored build
+# produces this at third_party/llama.cpp/build/bin/llama-cli.
+LLAMA_CLI=/usr/local/bin/llama-cli
+
+# Default args appended to every llama-cli invocation. Override per
+# alias via malu$model_alias.runtime_params.
+#
+# -no-cnv: disable conversation/chat mode (modern gguf models with
+#          a chat template default to interactive chat otherwise,
+#          which never exits and times out the daemon).
+# -st    : single-turn — produce one response and exit. Belt-and-
+#          suspenders alongside -no-cnv.
+LLAMA_DEFAULT_ARGS="-no-cnv -st --temp 0.0 -n 512 --no-display-prompt"
+
+# Maximum prompt length passed to llama-cli (characters). Longer
+# prompts are truncated with a warning and the response is marked as
+# error_class='prompt_truncated'.
+MAX_PROMPT_CHARS=200000
+
+# Soft request timeout (seconds). The daemon kills llama-cli after this
+# and writes a 'timeout' response status. Per-request timeout in
+# malu$model_request.timeout_ms wins if smaller.
+DEFAULT_TIMEOUT=300

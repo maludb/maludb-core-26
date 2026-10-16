@@ -1,0 +1,215 @@
+-- Stage 6 S6-1 — Local Node sync protocol + conflict records.
+--
+-- Exercises (per requirements.md §3.12):
+--   * register_local_node upsert; re-register with mismatched
+--     fingerprint raises.
+--   * node_submit lands a pending row + updates last_seen_at.
+--   * node_submit on a revoked node raises.
+--   * node_accept applies a claim_new submission via register_claim
+--     and records applied_object_type='claim' + applied_object_id.
+--   * node_accept on a non-pending submission raises.
+--   * node_reject flips status to 'rejected' + records reason.
+--   * node_record_conflict produces an explicit conflict row + flips
+--     submission to 'conflict' status.
+--   * revoke_local_node terminates a node; subsequent submissions
+--     refused.
+--   * Cross-tenant RLS: tenant B cannot see A's nodes or submissions.
+--   * Audit events emitted for each operation.
+
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+
+-- ---------- register a node ----------------------------------------
+SELECT register_local_node(
+    p_node_name   => 'edge-laptop-01',
+    p_fingerprint => 'sha256:ab12cd34',
+    p_uri         => 'https://10.0.0.42:8443',
+    p_description => 'Field engineer laptop'
+) AS node_id \gset
+
+SELECT node_name, fingerprint, uri, lifecycle_state
+FROM malu$local_memory_node WHERE node_id = :node_id;
+
+-- Re-register with same fingerprint is idempotent.
+SELECT register_local_node('edge-laptop-01', 'sha256:ab12cd34',
+                            'https://10.0.0.43:8443')
+       = :node_id AS reentrant_node_id_stable;
+
+-- Mismatched fingerprint raises.
+DO $body$
+BEGIN
+    PERFORM register_local_node('edge-laptop-01', 'sha256:DIFFERENT');
+    RAISE NOTICE 'UNEXPECTED: fingerprint mismatch accepted';
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'OK: fingerprint mismatch rejected';
+END;
+$body$;
+
+-- ---------- submit a claim_new proposal -----------------------------
+SELECT node_submit(
+    p_node_id         => :node_id,
+    p_submission_kind => 'claim_new',
+    p_payload_jsonb   => jsonb_build_object(
+        'subject', 'edge_sensor_22',
+        'verb',    'reported',
+        'object_value', 'temperature_anomaly',
+        'statement_text', 'Spike at 14:22Z while offline.'),
+    p_local_id   => 1001,
+    p_local_hash => 'sha256:edge-1001'
+) AS sub_a \gset
+
+SELECT submission_kind, status, local_id, local_hash
+FROM malu$node_sync_record WHERE submission_id = :sub_a;
+
+-- Duplicate (node_id, local_id, submission_kind) raises.
+DO $body$
+DECLARE v_node bigint := (SELECT node_id FROM malu$local_memory_node
+                          WHERE node_name = 'edge-laptop-01');
+BEGIN
+    PERFORM node_submit(v_node, 'claim_new',
+        jsonb_build_object('subject','x','verb','y'),
+        1001, 'sha256:edge-1001');
+    RAISE NOTICE 'UNEXPECTED: duplicate submission accepted';
+EXCEPTION WHEN unique_violation THEN
+    RAISE NOTICE 'OK: duplicate submission rejected';
+END;
+$body$;
+
+-- ---------- accept the proposal: register_claim invoked ------------
+SELECT node_accept(:sub_a, 'reviewed by oncall') AS accept_result;
+
+SELECT status, applied_object_type, applied_object_id IS NOT NULL
+       AS applied_id_set, decided_by IS NOT NULL AS decided_by_set
+FROM malu$node_sync_record WHERE submission_id = :sub_a;
+
+-- The claim row actually exists.
+SELECT subject, verb, statement_text
+FROM malu$claim WHERE claim_id = (
+    SELECT applied_object_id FROM malu$node_sync_record
+    WHERE submission_id = :sub_a);
+
+-- Re-accepting raises.
+DO $body$
+DECLARE v_sub bigint := (SELECT submission_id FROM malu$node_sync_record
+                         WHERE status = 'accepted' ORDER BY submission_id DESC LIMIT 1);
+BEGIN
+    PERFORM node_accept(v_sub, 'redo');
+    RAISE NOTICE 'UNEXPECTED: re-accept allowed';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: re-accept rejected';
+END;
+$body$;
+
+-- ---------- reject a different submission ---------------------------
+SELECT node_submit(
+    p_node_id   => :node_id,
+    p_submission_kind => 'memory_new',
+    p_payload_jsonb   => jsonb_build_object(
+        'memory_kind', 'observation',
+        'title',       'Stale snapshot — already in main store',
+        'summary',     'Local hash matched older central memory.'),
+    p_local_id => 1002
+) AS sub_b \gset
+
+SELECT node_reject(:sub_b, 'duplicate of central memory id=42');
+
+SELECT status, reason
+FROM malu$node_sync_record WHERE submission_id = :sub_b;
+
+-- ---------- conflict path -------------------------------------------
+SELECT node_submit(
+    p_node_id   => :node_id,
+    p_submission_kind => 'fact_new',
+    p_payload_jsonb   => jsonb_build_object(
+        'subject', 'edge_sensor_22',
+        'verb',    'verified',
+        'object_value','temperature_anomaly_root_cause',
+        'statement_text','Cooling failure (offline derivation).',
+        'claim_ids', jsonb_build_array()),
+    p_local_id => 1003
+) AS sub_c \gset
+
+-- Pretend the server already has a divergent fact about the same
+-- subject — record the conflict explicitly.
+SELECT node_record_conflict(
+    p_submission_id      => :sub_c,
+    p_conflict_kind      => 'divergent_content',
+    p_server_object_type => 'fact',
+    p_server_object_id   => 1::bigint,
+    p_resolution         => 'server_wins',
+    p_resolution_notes   => 'Server fact is more recent and verified.'
+) AS conflict_id \gset
+
+SELECT status FROM malu$node_sync_record WHERE submission_id = :sub_c;
+
+SELECT conflict_kind, resolution, server_object_type
+FROM malu$node_conflict_record WHERE conflict_id = :conflict_id;
+
+-- ---------- revoke node + post-revoke submission raises ------------
+SELECT revoke_local_node(:node_id, 'compromise suspected');
+
+SELECT lifecycle_state, revoked_at IS NOT NULL AS revoked_at_set
+FROM malu$local_memory_node WHERE node_id = :node_id;
+
+DO $body$
+DECLARE v_node bigint := (SELECT node_id FROM malu$local_memory_node
+                          WHERE node_name = 'edge-laptop-01');
+BEGIN
+    PERFORM node_submit(v_node, 'claim_new',
+        jsonb_build_object('subject','x','verb','y'),
+        9999);
+    RAISE NOTICE 'UNEXPECTED: post-revoke submission accepted';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: post-revoke submission rejected';
+END;
+$body$;
+
+-- ---------- cross-tenant RLS ---------------------------------------
+DROP ROLE   IF EXISTS s61_user_a;
+DROP ROLE   IF EXISTS s61_user_b;
+DROP SCHEMA IF EXISTS s61_a CASCADE;
+DROP SCHEMA IF EXISTS s61_b CASCADE;
+
+CREATE ROLE s61_user_a NOLOGIN;
+CREATE ROLE s61_user_b NOLOGIN;
+GRANT maludb_memory_executor TO s61_user_a, s61_user_b;
+GRANT USAGE ON SCHEMA maludb_core TO s61_user_a, s61_user_b;
+CREATE SCHEMA s61_a AUTHORIZATION s61_user_a;
+CREATE SCHEMA s61_b AUTHORIZATION s61_user_b;
+
+SET ROLE s61_user_a;
+SET search_path TO s61_a, maludb_core, public;
+SELECT register_local_node('a_node', 'sha256:tenant-a-only') AS a_node \gset
+SELECT node_submit(:a_node, 'claim_new',
+    jsonb_build_object('subject','a','verb','b'),
+    777);
+
+SET ROLE s61_user_b;
+SET search_path TO s61_b, maludb_core, public;
+SELECT count(*) AS b_sees_a_nodes
+FROM maludb_core.malu$local_memory_node WHERE node_name = 'a_node';
+SELECT count(*) AS b_sees_a_submissions FROM maludb_core.malu$node_sync_record;
+
+RESET ROLE;
+RESET search_path;
+SET search_path = maludb_core, public;
+
+-- ---------- audit emission summary ---------------------------------
+SELECT event_kind, count(*) AS n
+FROM malu$audit_event
+WHERE event_kind LIKE 'local_node_%' OR event_kind LIKE 'node_submission%'
+GROUP BY event_kind ORDER BY event_kind;
+
+-- ---------- cleanup ------------------------------------------------
+DELETE FROM malu$audit_event WHERE event_kind LIKE 'local_node_%' OR event_kind LIKE 'node_submission%';
+DELETE FROM malu$node_conflict_record WHERE submission_id IN (:sub_a, :sub_b, :sub_c);
+DELETE FROM malu$node_sync_record     WHERE submission_id IN (:sub_a, :sub_b, :sub_c);
+DELETE FROM malu$local_memory_node    WHERE node_id = :node_id;
+DELETE FROM malu$claim                WHERE subject = 'edge_sensor_22';
+DROP SCHEMA s61_a CASCADE;
+DROP SCHEMA s61_b CASCADE;
+DROP OWNED BY s61_user_a;
+DROP OWNED BY s61_user_b;
+DROP ROLE   s61_user_a;
+DROP ROLE   s61_user_b;

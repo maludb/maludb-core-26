@@ -1,0 +1,89 @@
+#!/usr/bin/make -f
+# Debian rules for the maludb source package.
+#
+# Builds four binary packages:
+#   postgresql-16-maludb-core  — PGXS extension for PG 16
+#   postgresql-17-maludb-core  — PGXS extension for PG 17
+#   postgresql-18-maludb-core  — PGXS extension for PG 18
+#   maludb-mc2dbd              — MC2DB listener daemon + systemd unit
+#
+# The per-PG-version loop is driven by pg_buildext. Versions to
+# build are listed in debian/pgversions.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# pg_buildext picks up the per-version PG_CONFIG by reading
+# debian/pgversions and invoking the right make per pass.
+PG_VERSIONS := $(shell cat debian/pgversions | grep -v '^\#' | tr '\n' ' ')
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	for v in $(PG_VERSIONS); do \
+	    $(MAKE) -C . clean PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config || true; \
+	done
+	$(MAKE) -C mc2dbd clean || true
+
+override_dh_auto_build:
+	for v in $(PG_VERSIONS); do \
+	    echo "==> building maludb_core for PG $$v"; \
+	    $(MAKE) -C . clean PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config || true; \
+	    $(MAKE) PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config; \
+	done
+	$(MAKE) -C mc2dbd PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+
+override_dh_auto_install:
+	# Stage every PG version's artifacts into a shared debian/tmp/
+	# tree. dh_install then routes the per-version paths into each
+	# binary package via debian/postgresql-V-maludb-core.install.
+	# The extension MUST be rebuilt for each PG version before install
+	# because PGXS embeds version-specific compiler flags.
+	for v in $(PG_VERSIONS); do \
+	    echo "==> installing maludb_core for PG $$v"; \
+	    $(MAKE) -C . clean PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config || true; \
+	    $(MAKE) PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config; \
+	    $(MAKE) install \
+	        PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config \
+	        DESTDIR=$(CURDIR)/debian/tmp; \
+	done
+	# Listener and helper scripts.
+	$(MAKE) -C mc2dbd install \
+	    PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config \
+	    DESTDIR=$(CURDIR)/debian/tmp
+	# Helper scripts into maludb-mc2dbd's docs path so operators
+	# have something to run after `apt install`. The validate script
+	# computes REPO_ROOT as one dir up from its own location and
+	# looks for gpu-check / model-runtime-check as siblings — they
+	# must be shipped alongside or validate degrades to WARN.
+	install -d $(CURDIR)/debian/tmp/usr/share/maludb/scripts
+	install -m 0755 scripts/maludb-validate \
+	                scripts/maludb-gpu-check \
+	                scripts/maludb-model-runtime-check \
+	    $(CURDIR)/debian/tmp/usr/share/maludb/scripts/
+
+override_dh_installsystemd:
+	# Stage the systemd unit with paths + user adjusted for the
+	# deb-install layout:
+	#   * binary moves /usr/local/sbin/ → /usr/sbin/ (Debian convention)
+	#   * User moves maludb_mc2dbd → maludb-mc2dbd (the postinst-created
+	#     OS user uses Debian's hyphen convention)
+	#   * Group follows the user (no shared 'maludb' group from the deb)
+	# The upstream mc2dbd/systemd/maludb-mc2dbd.service stays in the
+	# bootstrap conventions (underscore user, /usr/local/sbin path) so
+	# the source-clone install path keeps working.
+	#
+	# `-p maludb-mc2dbd` targets the listener binary package; without
+	# it the unit would land in the alphabetically-first package
+	# (postgresql-17-maludb-core, wrong).
+	sed -e 's|/usr/local/sbin/maludb_mc2dbd|/usr/sbin/maludb_mc2dbd|g' \
+	    -e 's|^User=maludb_mc2dbd|User=maludb-mc2dbd|' \
+	    -e 's|^Group=maludb$$|Group=maludb-mc2dbd|' \
+	    mc2dbd/systemd/maludb-mc2dbd.service > debian/maludb-mc2dbd.service
+	dh_installsystemd -p maludb-mc2dbd --no-enable --no-start
+	rm -f debian/maludb-mc2dbd.service
+
+override_dh_auto_test:
+	# Skip pg_regress at package-build time — it requires a running
+	# cluster. Operators run `make installcheck` after install.
+	@echo "Skipping pg_regress at dpkg-buildpackage time."

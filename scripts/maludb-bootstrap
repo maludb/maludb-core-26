@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# maludb-bootstrap — Ubuntu 24.04 bootstrap for MaluDB Release 1.0.
+# Phase R1.0-9.
+#
+# Idempotent. Safe to run multiple times. Skips steps that are already
+# in their target state. Default install is dev-friendly (TLS off,
+# bearer token off, listener on 127.0.0.1:5329, peer auth via Unix
+# socket). Production hardening lives in /etc/maludb/maludb-mc2dbd.conf
+# after the operator edits it.
+#
+# What this script does NOT do:
+#   - download or build llama.cpp (operator-controlled; see runtime/)
+#   - register a model alias (operator decides which gguf to use)
+#   - generate production TLS certs (use --tls=letsencrypt or NGINX in
+#     front when ready; default install uses self-signed for dev)
+
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/17/bin/pg_config}"
+DB_NAME="${DB_NAME:-maludb}"
+DB_OWNER="${DB_OWNER:-${USER:-maludb}}"
+SERVICE_USER="${SERVICE_USER:-maludb_mc2dbd}"
+MODELD_USER="${MODELD_USER:-maludb_modeld}"
+ETC_DIR=/etc/maludb
+LOG_DIR=/var/log/maludb
+TLS_DIR=$ETC_DIR/tls
+SBIN_DIR=/usr/local/sbin
+
+DRY_RUN=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n) DRY_RUN=1 ;;
+        --help|-h)
+            sed -n '2,15p' "$0"
+            cat <<EOH
+
+Usage: sudo $0 [--dry-run]
+  --dry-run / -n   print the install plan and exit without changes
+
+Environment:
+  PG_CONFIG       path to pg_config (default /usr/lib/postgresql/17/bin/pg_config)
+  DB_NAME         MaluDB-owned database name (default maludb)
+  SERVICE_USER    listener service OS user (default maludb_mc2dbd)
+  MODELD_USER     gateway service OS user (default maludb_modeld)
+  MALUDB_FORCE_OS=1   silence non-Ubuntu-24.04 prompt
+EOH
+            exit 0 ;;
+    esac
+done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    cat <<PLAN
+maludb-bootstrap will, on a clean Ubuntu 24.04 host:
+
+  1.  Verify the OS is Ubuntu 24.04
+  2.  Configure the PGDG apt repo (if not already)
+  3.  apt install:
+        postgresql-17, postgresql-server-dev-17, postgresql-17-pgvector,
+        postgresql-17-pgaudit, postgresql-17-partman,
+        build-essential, pkg-config, cmake,
+        libpq-dev, libmicrohttpd-dev, libjansson-dev, libgnutls28-dev,
+        libcurl4-openssl-dev, openssl, jq, curl
+  4.  Build maludb_core (PGXS) and maludb_mc2dbd from $REPO_ROOT
+  5.  sudo make install for the extension
+  6.  Create OS group:    maludb
+      Create OS users:    $SERVICE_USER, $MODELD_USER  (system, no shell)
+  7.  Create PG roles:    $SERVICE_USER, $MODELD_USER, and \$SUDO_USER (the operator)
+      Create database:    $DB_NAME (if missing)
+      CREATE EXTENSION maludb_core CASCADE;
+      ALTER DATABASE  ${DB_NAME} SET search_path TO maludb_core, public;
+      GRANT minimum privileges to each service role.
+      GRANT maludb-realm admin to the operator role (so psql -d ${DB_NAME} works directly).
+  8.  Install /etc/maludb/{maludb.conf, maludb-mc2dbd.conf, maludb-modeld.conf}
+      (preserves existing operator copies)
+  9.  Generate self-signed TLS cert at /etc/maludb/tls/server.{crt,key}
+      (skips if cert exists)
+ 10.  install -m 0755 \\
+        ./mc2dbd/maludb_mc2dbd      → /usr/local/sbin/maludb_mc2dbd
+        ./scripts/maludb_modeld     → /usr/local/sbin/maludb_modeld
+ 11.  Drop systemd units, daemon-reload (services NOT auto-enabled)
+
+After bootstrap, the operator runs:
+        sudo systemctl enable --now maludb-mc2dbd
+        scripts/maludb-validate
+PLAN
+    exit 0
+fi
+
+color()  { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+section(){ echo; color '1;34' "==> $*"; }
+ok()     { color '32' "    ✓ $*"; }
+skip()   { color '36' "    · $*"; }
+warn()   { color '33' "    ! $*"; }
+die()    { color '31' "    ✗ $*"; exit 1; }
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "$1 needs root; re-run with sudo"
+}
+
+# ---------------------------------------------------------------------
+# 0. Preflight
+# ---------------------------------------------------------------------
+section "Preflight"
+
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "24.04" ]; then
+        warn "Detected ${PRETTY_NAME:-unknown OS}; R1.0 targets Ubuntu 24.04"
+        warn "Continuing — set MALUDB_FORCE_OS=1 to silence in non-interactive use"
+        if [ "${MALUDB_FORCE_OS:-0}" != "1" ] && [ -t 0 ]; then
+            read -r -p "    Continue anyway? [y/N] " ans
+            [ "${ans:-N}" = "y" ] || [ "${ans:-N}" = "Y" ] || die "Aborted"
+        fi
+    else
+        ok "Ubuntu 24.04 detected"
+    fi
+fi
+
+[ -d "$REPO_ROOT/.git" ] || die "Bootstrap must run from the maludb-core repo (got $REPO_ROOT)"
+ok "Repo root: $REPO_ROOT"
+
+# ---------------------------------------------------------------------
+# 1. PGDG repo + apt deps
+# ---------------------------------------------------------------------
+section "Installing apt dependencies"
+
+if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
+    need_root "PGDG repo install"
+    install -d /usr/share/postgresql-common/pgdg
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list
+    apt-get -q update
+    ok "PGDG repo configured"
+else
+    skip "PGDG repo already configured"
+fi
+
+apt_install() {
+    local missing=()
+    for p in "$@"; do
+        dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        need_root "apt install"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+        ok "Installed: ${missing[*]}"
+    else
+        skip "Already installed: $*"
+    fi
+}
+
+apt_install \
+    postgresql-17 postgresql-server-dev-17 \
+    postgresql-17-pgvector postgresql-17-pgaudit postgresql-17-partman \
+    build-essential pkg-config cmake \
+    libpq-dev libmicrohttpd-dev libjansson-dev libgnutls28-dev \
+    libcurl4-openssl-dev openssl jq curl
+
+# ---------------------------------------------------------------------
+# 2. Build the extension and the listener
+# ---------------------------------------------------------------------
+section "Building maludb_core (PGXS) and maludb_mc2dbd"
+
+make -C "$REPO_ROOT" PG_CONFIG="$PG_CONFIG" >/dev/null
+ok "maludb_core built"
+
+make -C "$REPO_ROOT/mc2dbd" PG_CONFIG="$PG_CONFIG" >/dev/null
+ok "maludb_mc2dbd built"
+
+# ---------------------------------------------------------------------
+# 3. Install extension files into the cluster
+# ---------------------------------------------------------------------
+section "Installing maludb_core into PostgreSQL"
+
+need_root "extension install"
+make -C "$REPO_ROOT" install PG_CONFIG="$PG_CONFIG" >/dev/null
+ok "maludb_core installed"
+
+# ---------------------------------------------------------------------
+# 3a. Configure pgaudit (per docs/security-review.md finding #3)
+# ---------------------------------------------------------------------
+section "Configuring pgaudit preload"
+
+PG_VER=17
+PG_CLUSTER=main
+
+pg_conf_show() {
+    local key="$1"
+    pg_conftool "$PG_VER" "$PG_CLUSTER" show "$key" 2>/dev/null \
+        | awk -F'= ' '{print $2}' \
+        | tr -d "'" \
+        || true
+}
+
+# Read current value (empty if unset). pg_conftool always writes
+# /etc/postgresql/$PG_VER/$PG_CLUSTER/postgresql.conf, so this path
+# is immune to the ALTER SYSTEM list-GUC quoting trap that converts
+# a single-string list ('pgaudit, pg_stat_statements') into a
+# double-quoted blob that PG then treats as one library name.
+cur_preload="$(pg_conf_show shared_preload_libraries)"
+needs_restart=0
+
+for lib in pgaudit pg_stat_statements; do
+    if [[ ",${cur_preload}," != *",${lib},"* ]]; then
+        if [ -z "$cur_preload" ]; then
+            new_preload="$lib"
+        else
+            new_preload="${cur_preload},${lib}"
+        fi
+        need_root "pg_conftool shared_preload_libraries"
+        pg_conftool "$PG_VER" "$PG_CLUSTER" set shared_preload_libraries "$new_preload"
+        ok "shared_preload_libraries → $new_preload"
+        cur_preload="$new_preload"
+        needs_restart=1
+    else
+        skip "$lib already in shared_preload_libraries"
+    fi
+done
+
+# pgaudit.log target classes — safe defaults; operators can narrow later.
+# 'read' is deliberately excluded: SESSION-logging every SELECT grew one
+# deployment's log to 19GB and filled the disk (2026-07-06). The class
+# set matches pgaudit_recommended_settings() in the extension
+# ('ddl,role,write'). Add 'read' only for compliance regimes that
+# require it, paired with a logrotate maxsize policy.
+cur_log="$(pg_conf_show pgaudit.log)"
+target_log='write, ddl, role'
+if [ "$cur_log" != "$target_log" ]; then
+    need_root "pg_conftool pgaudit.log"
+    pg_conftool "$PG_VER" "$PG_CLUSTER" set pgaudit.log "$target_log"
+    ok "pgaudit.log → '$target_log'"
+    needs_restart=1
+else
+    skip "pgaudit.log already '$target_log'"
+fi
+
+if [ "$needs_restart" -eq 1 ]; then
+    need_root "systemctl restart postgresql@${PG_VER}-${PG_CLUSTER}"
+    systemctl restart "postgresql@${PG_VER}-${PG_CLUSTER}"
+    ok "PostgreSQL restarted (pgaudit now loaded)"
+
+    # Validate the GUC actually showed up.
+    if sudo -u postgres psql -tAc 'SHOW pgaudit.log' >/dev/null 2>&1; then
+        ok "pgaudit.log GUC visible"
+    else
+        warn "pgaudit.log GUC NOT visible — check journalctl -u postgresql@${PG_VER}-${PG_CLUSTER}"
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# 4. OS users
+# ---------------------------------------------------------------------
+section "Creating OS service users"
+
+# Shared maludb group so both daemons can write to /var/log/maludb.
+if getent group maludb >/dev/null 2>&1; then
+    skip "OS group maludb exists"
+else
+    need_root "groupadd maludb"
+    groupadd --system maludb
+    ok "Created OS group maludb"
+fi
+
+for u in "$SERVICE_USER" "$MODELD_USER"; do
+    if id "$u" >/dev/null 2>&1; then
+        skip "OS user $u exists"
+    else
+        need_root "useradd $u"
+        useradd --system --no-create-home --shell /usr/sbin/nologin \
+                --gid maludb "$u"
+        ok "Created OS user $u (primary group maludb)"
+    fi
+    # Idempotently ensure existing users are members.
+    usermod -aG maludb "$u" 2>/dev/null || true
+done
+
+# ---------------------------------------------------------------------
+# 5. Database and PG role
+# ---------------------------------------------------------------------
+section "Configuring PostgreSQL roles and database"
+
+run_pg() { sudo -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
+
+for r in "$SERVICE_USER" "$MODELD_USER"; do
+    if run_pg -tAc "SELECT 1 FROM pg_roles WHERE rolname='${r}'" | grep -q 1; then
+        skip "PG role ${r} exists"
+    else
+        need_root "create PG role"
+        run_pg -c "CREATE ROLE ${r} LOGIN;"
+        ok "Created PG role ${r} (peer-auth via Unix socket)"
+    fi
+done
+
+if run_pg -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
+    skip "Database ${DB_NAME} exists"
+else
+    need_root "create database"
+    run_pg -c "CREATE DATABASE ${DB_NAME};"
+    ok "Created database ${DB_NAME}"
+fi
+
+# Install extension + grant the two service roles their respective
+# privileges. The extension owner remains the cluster superuser; the
+# service roles are deliberately minimal:
+#   maludb_mc2dbd  — read catalog, INSERT audit, EXECUTE mc2db.* and
+#                    maludb_core.* (so registered tools can run).
+#   maludb_modeld  — SELECT pending requests, UPDATE request status,
+#                    INSERT response rows. No mc2db/listener access.
+run_pg -d "$DB_NAME" -c "
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname='vector') THEN
+      CREATE EXTENSION vector;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname='maludb_core') THEN
+      CREATE EXTENSION maludb_core CASCADE;
+  END IF;
+END \$\$;
+
+-- Listener role
+GRANT USAGE  ON SCHEMA maludb_core TO ${SERVICE_USER};
+GRANT USAGE  ON SCHEMA mc2db       TO ${SERVICE_USER};
+GRANT SELECT ON ALL TABLES IN SCHEMA maludb_core TO ${SERVICE_USER};
+GRANT INSERT ON maludb_core.\"malu\$mc2db_invocation\" TO ${SERVICE_USER};
+-- The R1.0 sql_function tools wrap maludb_core APIs (start_session,
+-- append_context, render_prompt, submit_render, register_*) which
+-- INSERT/UPDATE/DELETE on the catalog tables. Without these grants,
+-- every writing tool fails with permission denied — verified during
+-- R1.0-10 field test on a clean Ubuntu 24.04 box.
+GRANT INSERT, UPDATE, DELETE ON
+    maludb_core.\"malu\$account\",
+    maludb_core.\"malu\$session\",
+    maludb_core.\"malu\$session_context\",
+    maludb_core.\"malu\$prompt_render\",
+    maludb_core.\"malu\$model_request\",
+    maludb_core.\"malu\$model_response\",
+    maludb_core.\"malu\$model_provider\",
+    maludb_core.\"malu\$model_alias\",
+    maludb_core.\"malu\$prompt_template\"
+    TO ${SERVICE_USER};
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA maludb_core TO ${SERVICE_USER};
+GRANT EXECUTE ON ALL FUNCTIONS  IN SCHEMA mc2db        TO ${SERVICE_USER};
+GRANT EXECUTE ON ALL FUNCTIONS  IN SCHEMA maludb_core  TO ${SERVICE_USER};
+GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA mc2db        TO ${SERVICE_USER};
+
+-- Model gateway role
+GRANT USAGE  ON SCHEMA maludb_core TO ${MODELD_USER};
+GRANT SELECT, UPDATE ON maludb_core.\"malu\$model_request\"  TO ${MODELD_USER};
+GRANT SELECT         ON maludb_core.\"malu\$model_alias\"    TO ${MODELD_USER};
+GRANT SELECT         ON maludb_core.\"malu\$model_provider\" TO ${MODELD_USER};
+GRANT INSERT         ON maludb_core.\"malu\$model_response\" TO ${MODELD_USER};
+GRANT USAGE, SELECT  ON SEQUENCE maludb_core.\"malu\$model_response_response_id_seq\" TO ${MODELD_USER};
+
+-- R1.1-7: both service users are trusted gateways that manage tenancy
+-- upstream (bearer token → account). Grant maludb_llm_admin AND set
+-- BYPASSRLS directly on each service role — BYPASSRLS is a role
+-- attribute that does NOT propagate via GRANT, so the GRANT alone
+-- leaves the listener / modeld subject to RLS and unable to read the
+-- rows they just inserted. Per-request tenant enforcement (listener
+-- sets maludb_core.current_account_id per call) is the follow-up.
+-- The grants and ALTER ROLE are gated on the LLM admin role's
+-- presence so the script stays compatible with older extension
+-- installs (0.2.x and earlier).
+DO \$\$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='maludb_llm_admin') THEN
+        EXECUTE format('GRANT maludb_llm_admin TO %I', '${SERVICE_USER}');
+        EXECUTE format('GRANT maludb_llm_admin TO %I', '${MODELD_USER}');
+        EXECUTE format('ALTER ROLE %I BYPASSRLS', '${SERVICE_USER}');
+        EXECUTE format('ALTER ROLE %I BYPASSRLS', '${MODELD_USER}');
+    END IF;
+END
+\$\$;
+" >/dev/null
+ok "Extension active in ${DB_NAME}; ${SERVICE_USER} and ${MODELD_USER} granted"
+
+# Make maludb_core visible to every connection to the maludb database.
+# Without this, callers of unqualified names (register_model_provider,
+# start_session, render_prompt, ...) hit "function does not exist"
+# because the default search_path is "\$user", public. This is the
+# convention used by most PostgreSQL extensions that ship a schema.
+run_pg -c "ALTER DATABASE ${DB_NAME} SET search_path TO maludb_core, public;" >/dev/null
+ok "ALTER DATABASE ${DB_NAME} SET search_path TO maludb_core, public"
+
+# Operator PG role: when bootstrap was invoked via sudo, also create a
+# PG role matching $SUDO_USER so `psql -d maludb` and the validate
+# script work directly without further setup. Operator is granted full
+# DML on the maludb-realm schemas — they're a maludb administrator,
+# not a model client. Production multi-tenant deployments should
+# instead use R1.1-7's per-account roles.
+OPERATOR="${SUDO_USER:-}"
+if [ -n "$OPERATOR" ] && [ "$OPERATOR" != "root" ]; then
+    if run_pg -tAc "SELECT 1 FROM pg_roles WHERE rolname='${OPERATOR}'" | grep -q 1; then
+        skip "PG role ${OPERATOR} (operator) exists"
+    else
+        run_pg -c "CREATE ROLE ${OPERATOR} LOGIN CREATEDB SUPERUSER;"
+        ok "Created PG role ${OPERATOR} (operator, peer-auth, CREATEDB, SUPERUSER)"
+    fi
+    # Idempotently ensure CREATEDB + SUPERUSER are set on pre-existing
+    # roles. pg_regress's installcheck needs both: CREATEDB to provision
+    # contrib_regression, SUPERUSER to ALTER DATABASE ... SET lc_messages
+    # (a su-only GUC). Operators who'd rather lock down may revoke
+    # SUPERUSER after install — they just won't be able to run
+    # installcheck without sudo -u postgres.
+    run_pg -c "ALTER ROLE ${OPERATOR} CREATEDB SUPERUSER;" >/dev/null
+    run_pg -d "$DB_NAME" -c "
+GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${OPERATOR};
+GRANT ALL ON SCHEMA maludb_core, mc2db TO ${OPERATOR};
+GRANT ALL ON ALL TABLES     IN SCHEMA maludb_core, mc2db TO ${OPERATOR};
+GRANT ALL ON ALL SEQUENCES  IN SCHEMA maludb_core, mc2db TO ${OPERATOR};
+GRANT ALL ON ALL FUNCTIONS  IN SCHEMA maludb_core, mc2db TO ${OPERATOR};
+GRANT ALL ON ALL PROCEDURES IN SCHEMA maludb_core, mc2db TO ${OPERATOR};
+" >/dev/null
+    ok "${OPERATOR} granted maludb-realm admin in ${DB_NAME}"
+fi
+
+# ---------------------------------------------------------------------
+# 6. /etc/maludb config tree
+# ---------------------------------------------------------------------
+section "Installing config files"
+
+need_root "/etc/maludb"
+install -d -m 0755 "$ETC_DIR"
+install -d -m 2770 -o root             -g maludb         "$LOG_DIR"
+install -d -m 0750 -o "$SERVICE_USER"  -g maludb         "$TLS_DIR"
+
+for src in \
+    "$REPO_ROOT/etc/maludb.conf.example:$ETC_DIR/maludb.conf" \
+    "$REPO_ROOT/etc/maludb-modeld.conf.example:$ETC_DIR/maludb-modeld.conf" \
+    "$REPO_ROOT/mc2dbd/etc/maludb-mc2dbd.conf.example:$ETC_DIR/maludb-mc2dbd.conf"; do
+    s="${src%%:*}"; d="${src##*:}"
+    if [ -f "$d" ]; then
+        skip "$d already exists (operator override preserved)"
+    else
+        install -m 0640 -o root -g maludb "$s" "$d"
+        ok "Installed $d"
+    fi
+done
+
+# ---------------------------------------------------------------------
+# 7. TLS bootstrap (self-signed for dev)
+# ---------------------------------------------------------------------
+section "TLS bootstrap"
+
+if [ -f "$TLS_DIR/server.crt" ] && [ -f "$TLS_DIR/server.key" ]; then
+    skip "TLS cert/key already present in $TLS_DIR"
+else
+    need_root "TLS init"
+    "$REPO_ROOT/scripts/maludb-tls-init" --out-dir "$TLS_DIR" \
+        --owner "$SERVICE_USER" --group maludb
+    ok "Generated self-signed TLS cert at $TLS_DIR/server.crt"
+fi
+
+# ---------------------------------------------------------------------
+# 8. Install the listener and gateway binaries to /usr/local/sbin
+# ---------------------------------------------------------------------
+section "Installing service binaries"
+
+need_root "service binary install"
+install -m 0755 "$REPO_ROOT/mc2dbd/maludb_mc2dbd" "$SBIN_DIR/maludb_mc2dbd"
+install -m 0755 "$REPO_ROOT/scripts/maludb_modeld" "$SBIN_DIR/maludb_modeld"
+ok "Installed: $SBIN_DIR/maludb_mc2dbd, $SBIN_DIR/maludb_modeld"
+
+# ---------------------------------------------------------------------
+# 9. systemd units
+# ---------------------------------------------------------------------
+section "systemd units"
+
+need_root "systemd unit install"
+install -m 0644 "$REPO_ROOT/mc2dbd/systemd/maludb-mc2dbd.service" /etc/systemd/system/maludb-mc2dbd.service
+install -m 0644 "$REPO_ROOT/systemd/maludb-modeld.service"        /etc/systemd/system/maludb-modeld.service
+systemctl daemon-reload
+ok "Installed maludb-mc2dbd.service and maludb-modeld.service"
+
+# ---------------------------------------------------------------------
+# 10. Summary + next steps
+# ---------------------------------------------------------------------
+section "Bootstrap complete"
+
+cat <<EOM
+Next steps:
+
+  1. Review /etc/maludb/maludb-mc2dbd.conf and /etc/maludb/maludb-modeld.conf.
+  2. To enable the listener:
+         sudo systemctl enable --now maludb-mc2dbd
+  3. To enable the model gateway (only if you've registered a local model):
+         sudo systemctl enable --now maludb-modeld
+  4. Run the post-install validator:
+         scripts/maludb-validate
+  5. Smoke-test the listener:
+         curl -sS http://127.0.0.1:5329/healthz
+         curl -sS -X POST http://127.0.0.1:5329/ \\
+              -H 'Content-Type: application/json' \\
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+
+Local model setup is operator-controlled — see runtime/Makefile and
+docs/runtime.md to build llama.cpp, then register a model alias in
+maludb_core via maludb.models.list.
+EOM

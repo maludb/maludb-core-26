@@ -1,0 +1,81 @@
+-- S7-2.a — owner_schema + RLS on malu$mc2db_invocation.
+--
+-- Exercises:
+--   * Schema gained an owner_schema NOT NULL column.
+--   * RLS is enabled; tenant_owner policy attached.
+--   * Cross-tenant: tenant B can't see invocation rows owned by
+--     tenant A.
+--   * Backfilled rows (pre-migration) carry owner_schema='maludb_core'
+--     so superuser still sees them and tenants see only their own.
+
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+
+-- ---------- schema check -------------------------------------------
+SELECT column_name, is_nullable, data_type
+FROM information_schema.columns
+WHERE table_schema = 'maludb_core'
+  AND table_name   = 'malu$mc2db_invocation'
+  AND column_name  = 'owner_schema';
+
+SELECT c.relrowsecurity AS rls_enabled,
+       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'maludb_core' AND c.relname = 'malu$mc2db_invocation';
+
+-- ---------- cross-tenant isolation --------------------------------
+DROP ROLE   IF EXISTS s72a_user_a;
+DROP ROLE   IF EXISTS s72a_user_b;
+DROP SCHEMA IF EXISTS s72a_a CASCADE;
+DROP SCHEMA IF EXISTS s72a_b CASCADE;
+
+CREATE ROLE s72a_user_a NOLOGIN;
+CREATE ROLE s72a_user_b NOLOGIN;
+GRANT maludb_memory_executor TO s72a_user_a, s72a_user_b;
+GRANT USAGE ON SCHEMA maludb_core TO s72a_user_a, s72a_user_b;
+CREATE SCHEMA s72a_a AUTHORIZATION s72a_user_a;
+CREATE SCHEMA s72a_b AUTHORIZATION s72a_user_b;
+
+-- Insert an invocation row as the extension owner (superuser in
+-- regress) but with owner_schema set to tenant A. This mirrors what
+-- the dispatcher does after SET LOCAL ROLE.
+INSERT INTO malu$mc2db_invocation
+    (owner_schema, tool_name, implementation_type, success)
+VALUES ('s72a_a', 's72a.tool_a', 'sql_function', true);
+
+INSERT INTO malu$mc2db_invocation
+    (owner_schema, tool_name, implementation_type, success)
+VALUES ('s72a_b', 's72a.tool_b', 'sql_function', true);
+
+-- As tenant A: should see only the A row.
+SET ROLE s72a_user_a;
+SET search_path TO s72a_a, maludb_core, public;
+SELECT count(*) AS a_sees_a_rows
+FROM maludb_core.malu$mc2db_invocation WHERE tool_name LIKE 's72a.%';
+
+-- As tenant B: should see only the B row.
+SET ROLE s72a_user_b;
+SET search_path TO s72a_b, maludb_core, public;
+SELECT count(*) AS b_sees_a_rows
+FROM maludb_core.malu$mc2db_invocation WHERE tool_name = 's72a.tool_a';
+SELECT count(*) AS b_sees_b_rows
+FROM maludb_core.malu$mc2db_invocation WHERE tool_name = 's72a.tool_b';
+
+RESET ROLE;
+RESET search_path;
+SET search_path = maludb_core, public;
+
+-- Superuser sees both (RLS not forced).
+SELECT count(*) AS super_sees_all
+FROM malu$mc2db_invocation WHERE tool_name LIKE 's72a.%';
+
+-- ---------- cleanup -----------------------------------------------
+DELETE FROM malu$mc2db_invocation WHERE tool_name LIKE 's72a.%';
+DROP SCHEMA s72a_a CASCADE;
+DROP SCHEMA s72a_b CASCADE;
+DROP OWNED BY s72a_user_a;
+DROP OWNED BY s72a_user_b;
+DROP ROLE   s72a_user_a;
+DROP ROLE   s72a_user_b;

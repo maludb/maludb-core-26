@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# maludb_modeld — MaluDB model gateway daemon. Phase R1.0-9.
+#
+# Polls malu$model_request for status='pending' rows that resolve to a
+# real local/cloud provider (stub providers are handled synchronously
+# by the listener via mc_stub_process and never appear here for long).
+# For each pending row:
+#   local_runtime → exec llama-cli with the rendered prompt, capture
+#                   stdout, write a 'succeeded' response with
+#                   adapter_name='llama-cli', finish_reason='stop'
+#   cloud_api     → write a 'failed' response with error_class
+#                   ='ADAPTER_NOT_AVAILABLE' (R1.1 will wire real
+#                   cloud adapters)
+#   anything else → leave it alone for now
+#
+# Idempotent. Restart-safe. SIGTERM exits cleanly after the current
+# request finishes (or immediately if idle).
+
+set -uo pipefail
+
+# Defaults — overridable via /etc/maludb/maludb*.conf or env.
+: "${PG_CONNINFO:=}"
+: "${PG_DATABASE:=maludb}"
+: "${POLL_INTERVAL:=5}"
+: "${LLAMA_CLI:=/usr/local/bin/llama-cli}"
+: "${LLAMA_DEFAULT_ARGS:=-no-cnv -st --simple-io --temp 0.0 -n 512 --no-display-prompt}"
+: "${MAX_PROMPT_CHARS:=200000}"
+: "${DEFAULT_TIMEOUT:=300}"
+: "${LOG_DIR:=/var/log/maludb}"
+
+PSQL=(psql -X -q -t -A -F $'\t' -v ON_ERROR_STOP=1)
+[ -n "${PG_CONNINFO}" ] && PSQL+=("${PG_CONNINFO}") || PSQL+=("-d" "${PG_DATABASE}")
+
+ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { printf '%s %s maludb_modeld %s\n' "$(ts)" "$1" "${*:2}" >&2; }
+
+g_running=1
+on_signal() { log info "received signal, exiting after current cycle"; g_running=0; }
+trap on_signal TERM INT
+
+# ---------------------------------------------------------------------
+# claim_one — atomically pick the oldest pending request and lock it.
+# Returns: request_id\talias_name\tprovider_kind\trendered_prompt_path\ttimeout_ms\tprompt_hash
+# Empty string on no work.
+# ---------------------------------------------------------------------
+claim_one() {
+    "${PSQL[@]}" <<'SQL'
+BEGIN;
+SET LOCAL search_path = maludb_core, public;
+WITH pick AS (
+    SELECT mr.request_id
+    FROM malu$model_request mr
+    JOIN malu$model_alias    ma ON ma.alias_id   = mr.alias_id
+    JOIN malu$model_provider mp ON mp.provider_id = ma.provider_id
+    WHERE mr.status = 'pending'
+      AND mp.provider_kind <> 'stub'
+    ORDER BY mr.submitted_at
+    LIMIT 1
+    FOR UPDATE OF mr SKIP LOCKED
+),
+moved AS (
+    UPDATE malu$model_request mr
+       SET status = 'running',
+           started_at = COALESCE(mr.started_at, now())
+      FROM pick
+     WHERE mr.request_id = pick.request_id
+    RETURNING mr.request_id
+)
+-- One JSON object per row keeps the daemon's parse robust against
+-- newlines, tabs, or any other byte inside rendered_prompt. Tab-
+-- separated output broke the bash `read -r <<<"$row"` because read
+-- stops at the first newline and silently dropped trailing fields.
+SELECT jsonb_build_object(
+    'request_id',      mr.request_id,
+    'alias_name',      ma.alias_name,
+    'provider_kind',   mp.provider_kind,
+    'model_path',      ma.model_path,
+    'rendered_prompt', mr.rendered_prompt,
+    'timeout_ms',      mr.timeout_ms,
+    'prompt_hash',     mr.prompt_hash
+)::text
+FROM moved
+JOIN malu$model_request mr USING (request_id)
+JOIN malu$model_alias    ma ON ma.alias_id    = mr.alias_id
+JOIN malu$model_provider mp ON mp.provider_id = ma.provider_id;
+COMMIT;
+SQL
+}
+
+# ---------------------------------------------------------------------
+# write_response — INSERT into malu$model_response and flip the request.
+# ---------------------------------------------------------------------
+write_response() {
+    local request_id=$1 status=$2 output_text=$3 adapter=$4 finish_reason=$5
+    local error_class=$6 user_safe_error=$7 latency_ms=$8 prompt_hash=$9
+    local output_hash=""
+    if [ -n "$output_text" ]; then
+        output_hash=$(printf '%s' "$output_text" | sha256sum | awk '{print $1}')
+    fi
+    # Heredoc delimiter is quoted ('SQL') so bash performs no expansion —
+    # values are passed via psql -v to avoid both `set -u` errors on bare
+    # `$identifier` patterns AND SQL-injection through embedded payload.
+    PGOPTIONS="-c search_path=maludb_core,public" \
+        "${PSQL[@]}" \
+            -v rid="$request_id" \
+            -v st="$status" \
+            -v ot="$output_text" \
+            -v oh="$output_hash" \
+            -v fr="$finish_reason" \
+            -v lm="$latency_ms" \
+            -v ec="$error_class" \
+            -v use="$user_safe_error" \
+            -v ad="$adapter" \
+            <<'SQL'
+INSERT INTO malu$model_response
+       (request_id, status, output_text, output_hash, finish_reason,
+        prompt_tokens, completion_tokens, latency_ms,
+        error_class, user_safe_error, adapter_name)
+VALUES (:'rid'::bigint,    :'st',
+        NULLIF(:'ot',''),  NULLIF(:'oh',''),  NULLIF(:'fr',''),
+        NULL, NULL,        :'lm'::integer,
+        NULLIF(:'ec',''),  NULLIF(:'use',''),
+        :'ad');
+UPDATE malu$model_request
+   SET status      = :'st',
+       finished_at = now()
+ WHERE request_id  = :'rid'::bigint;
+SQL
+}
+
+# ---------------------------------------------------------------------
+# dispatch_local_runtime — spawn llama-cli, capture output.
+# ---------------------------------------------------------------------
+dispatch_local_runtime() {
+    local request_id=$1 alias_name=$2 model_path=$3 rendered_prompt=$4
+    local timeout_ms=$5 prompt_hash=$6
+    local timeout_s=$((timeout_ms / 1000))
+    [ "$timeout_s" -lt 1 ] && timeout_s=1
+    [ "$timeout_s" -gt "$DEFAULT_TIMEOUT" ] && timeout_s=$DEFAULT_TIMEOUT
+
+    if [ ! -x "$LLAMA_CLI" ]; then
+        write_response "$request_id" failed "" "llama-cli" "" \
+            "ADAPTER_NOT_AVAILABLE" "llama-cli not installed at $LLAMA_CLI" 0 "$prompt_hash"
+        log warn "llama-cli missing at $LLAMA_CLI; failed request $request_id"
+        return
+    fi
+    if [ -z "$model_path" ] || [ ! -f "$model_path" ]; then
+        write_response "$request_id" failed "" "llama-cli" "" \
+            "MODEL_NOT_FOUND" "model_path missing or unreadable: $model_path" 0 "$prompt_hash"
+        log warn "model_path missing for alias $alias_name; failed request $request_id"
+        return
+    fi
+    if [ "${#rendered_prompt}" -gt "$MAX_PROMPT_CHARS" ]; then
+        write_response "$request_id" failed "" "llama-cli" "" \
+            "PROMPT_TOO_LONG" "rendered_prompt exceeds MAX_PROMPT_CHARS" 0 "$prompt_hash"
+        log warn "prompt too long for request $request_id"
+        return
+    fi
+
+    local tmp_out tmp_err t0 t1 latency_ms rc
+    tmp_out=$(mktemp); tmp_err=$(mktemp)
+    t0=$(date +%s%3N)
+    # shellcheck disable=SC2086
+    timeout --foreground "$timeout_s" \
+        "$LLAMA_CLI" -m "$model_path" -p "$rendered_prompt" \
+        $LLAMA_DEFAULT_ARGS \
+        >"$tmp_out" 2>"$tmp_err"
+    rc=$?
+    t1=$(date +%s%3N)
+    latency_ms=$((t1 - t0))
+
+    if [ "$rc" -eq 124 ]; then
+        write_response "$request_id" timeout "" "llama-cli" "length" \
+            "TIMEOUT" "llama-cli exceeded ${timeout_s}s" "$latency_ms" "$prompt_hash"
+        log warn "request $request_id timed out after ${timeout_s}s"
+    elif [ "$rc" -ne 0 ]; then
+        local err
+        err=$(head -c 4096 "$tmp_err" | tr '\n' ' ' | tr "'" '"')
+        write_response "$request_id" failed "" "llama-cli" "" \
+            "ADAPTER_FAILED" "llama-cli rc=${rc}: ${err}" "$latency_ms" "$prompt_hash"
+        log warn "request $request_id llama-cli rc=$rc"
+    else
+        local out raw
+        # llama-cli (b9019) prints an ASCII banner, a commands list, the
+        # echoed prompt, the assistant response, then a perf line like
+        # "[ Prompt: 20.7 t/s | Generation: 5.9 t/s ]" and "Exiting...".
+        # --simple-io suppresses most of the banner; this awk pass is the
+        # belt-and-suspenders cleanup. It drops everything up through the
+        # last "available commands:" or "> " line if any survived, and
+        # strips the perf line and trailer. Single quotes in the body are
+        # already safe under our psql -v parameterization.
+        raw=$(cat "$tmp_out")
+        # Drop known-noise patterns from llama-cli output. Print everything
+        # else. With -no-cnv -st --simple-io the output is mostly clean
+        # already; this is defensive cleanup for edge cases (chat-template
+        # prompt echo, memory-breakdown trailer, ASCII banner art).
+        out=$(printf '%s' "$raw" | awk '
+            /^\[ Prompt:.*\| Generation:.*\]$/ { exit }
+            /^Exiting\.\.\./                    { exit }
+            /^common_memory_breakdown_print:/   { next }
+            /^build[[:space:]]*:/               { next }
+            /^model[[:space:]]*:/               { next }
+            /^modalities[[:space:]]*:/          { next }
+            /^available commands:/              { next }
+            /^[[:space:]]+\/(exit|regen|clear|read|glob)\>/ { next }
+            /^Loading model/                    { next }
+            /^[█▀▄ ]+$/                         { next }
+            /^> /                               { next }
+            { print }
+        ')
+        # Trim leading/trailing blank lines
+        out=$(printf '%s' "$out" | sed -e '/./,$!d' -e ':a' -e '/^$/{$d;N;ba' -e '}')
+        write_response "$request_id" succeeded "$out" "llama-cli" "stop" \
+            "" "" "$latency_ms" "$prompt_hash"
+        log info "request $request_id succeeded latency=${latency_ms}ms raw=${#raw} clean=${#out}"
+    fi
+    rm -f "$tmp_out" "$tmp_err"
+}
+
+# ---------------------------------------------------------------------
+# dispatch_cloud_api — R1.1 wires real cloud adapters. R1.0 fails fast.
+# ---------------------------------------------------------------------
+dispatch_cloud_api() {
+    local request_id=$1
+    write_response "$request_id" failed "" "cloud-stub" "" \
+        "ADAPTER_NOT_AVAILABLE" "cloud_api dispatch is deferred to R1.1" 0 ""
+    log warn "request $request_id cloud_api rejected (R1.1)"
+}
+
+# ---------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------
+log info "maludb_modeld starting (poll=${POLL_INTERVAL}s, llama=${LLAMA_CLI})"
+
+claim_failures=0
+while [ "$g_running" -eq 1 ]; do
+    # Capture stderr separately so peer-auth or query failures end up
+    # in journalctl instead of being silently dropped.
+    if ! row=$(claim_one 2>/tmp/maludb_modeld_claim.err); then
+        claim_failures=$((claim_failures + 1))
+        # Throttle: log every 5th consecutive failure to keep journal
+        # noise down when PG is just temporarily unavailable.
+        if [ $((claim_failures % 5)) -eq 1 ]; then
+            log warn "claim_one failed ($claim_failures consecutive): $(head -c 400 /tmp/maludb_modeld_claim.err 2>/dev/null | tr '\n' ' ')"
+        fi
+        sleep "$POLL_INTERVAL"
+        continue
+    fi
+    [ "$claim_failures" -gt 0 ] && log info "claim recovered after $claim_failures failures"
+    claim_failures=0
+    if [ -z "$row" ]; then
+        sleep "$POLL_INTERVAL"
+        continue
+    fi
+    # claim_one returns one JSON object per row. jq round-trips arbitrary
+    # bytes (newlines, tabs, NULs are all fine) so the parse is robust.
+    if ! request_id=$(jq -er '.request_id' <<<"$row" 2>>/tmp/maludb_modeld_jq.err); then
+        log warn "claim_one returned non-JSON: $(printf '%.200s' "$row")"
+        sleep "$POLL_INTERVAL"
+        continue
+    fi
+    alias_name=$(     jq -r '.alias_name'      <<<"$row")
+    provider_kind=$(  jq -r '.provider_kind'   <<<"$row")
+    model_path=$(     jq -r '.model_path // ""' <<<"$row")
+    rendered_prompt=$(jq -r '.rendered_prompt' <<<"$row")
+    timeout_ms=$(     jq -r '.timeout_ms'      <<<"$row")
+    prompt_hash=$(    jq -r '.prompt_hash'     <<<"$row")
+    case "$provider_kind" in
+        local_runtime|local_http|local_socket)
+            dispatch_local_runtime "$request_id" "$alias_name" \
+                "$model_path" "$rendered_prompt" "$timeout_ms" "$prompt_hash"
+            ;;
+        cloud_api)
+            dispatch_cloud_api "$request_id"
+            ;;
+        *)
+            log warn "request $request_id unhandled provider_kind=$provider_kind, skipping"
+            ;;
+    esac
+done
+
+log info "maludb_modeld stopped"

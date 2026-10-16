@@ -1,0 +1,28 @@
+# /etc/maludb/maludb-mc2dbd.conf
+#
+# This file is read by the systemd unit as environment for
+# maludb_mc2dbd. Lines starting with # are comments. Blank lines are
+# ignored. Other lines are KEY=VALUE; quoting is shell-style.
+
+# Bind address. Default 127.0.0.1. Use a routable address only if you
+# also enable TLS and authentication.
+HOST=127.0.0.1
+
+# TCP port. Default 5329 per release-1.0-requirements.md §9.
+PORT=5329
+
+# libpq connection string. The listener's systemd unit runs as OS user
+# maludb_mc2dbd; with peer auth the PG role name must match. Bootstrap
+# creates this PG role with the right grants.
+PG_CONNINFO="host=/var/run/postgresql user=maludb_mc2dbd dbname=maludb"
+
+# Bearer token. If unset and MALUDB_MC2DBD_TOKEN is also unset, the
+# listener accepts unauthenticated requests (development only).
+# BEARER_TOKEN=replace-with-a-long-random-secret
+
+# TLS. Default off — production deployments either enable here or run
+# behind an NGINX terminator. The R1.0 listener uses libmicrohttpd's
+# GnuTLS support when TLS=true.
+TLS=false
+# TLS_CERT=/etc/maludb/tls/server.crt
+# TLS_KEY=/etc/maludb/tls/server.key

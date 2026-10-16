@@ -1,0 +1,132 @@
+.TH MALUDB_MC2DBD 8 "2026-05-12" "maludb_mc2dbd 0.4.0" "MaluDB"
+.SH NAME
+maludb_mc2dbd \- MaluDB MC2DB listener (MCP-over-HTTPS sidecar)
+.SH SYNOPSIS
+.B maludb_mc2dbd
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B maludb_mc2dbd
+exposes the MaluDB MC2DB tool registry as an MCP-compatible HTTP/HTTPS
+endpoint. It connects to a PostgreSQL cluster running the
+.B maludb_core
+extension and dispatches MCP
+.I tools/call
+requests via one of four implementation_type backends:
+.TP
+.B sql_function
+libpq into the PostgreSQL session (read or read-write per tool catalog).
+.TP
+.B external_exec
+fork+exec a registered command with per-tool timeout, scrubbed env, and
+absolute-path-only enforcement.
+.TP
+.B mcp_proxy
+forwards
+.I tools/call
+to a remote MCP server over HTTP or stdio transport.
+.TP
+.B http_endpoint
+generic REST-call dispatcher (POST/PUT/PATCH bodies from arguments
+JSON, GET/DELETE bodyless), with optional bearer or basic auth.
+.PP
+The listener also exposes a Prometheus-compatible
+.B /metrics
+endpoint and a
+.B /healthz
+liveness probe.
+.SH OPTIONS
+.TP
+.BR \-\-host " " \fIHOST\fR
+Bind host. Default
+.IR 127.0.0.1 .
+.TP
+.BR \-\-port " " \fIPORT\fR
+Bind port. Default
+.IR 5329 .
+.TP
+.BR \-\-pg-conninfo " " \fISTRING\fR
+libpq connection string. Falls back to the standard
+.BR PGHOST ", " PGDATABASE ", " PGUSER
+environment variables if unset.
+.TP
+.B \-\-tls
+Enable TLS on the listener. Requires
+.B \-\-tls-cert
+and
+.BR \-\-tls-key .
+.TP
+.BR \-\-tls-cert " " \fIPATH\fR
+TLS certificate file (PEM).
+.TP
+.BR \-\-tls-key " " \fIPATH\fR
+TLS private key file (PEM).
+.TP
+.BR \-\-bearer-token " " \fITOKEN\fR
+Require
+.I Authorization: Bearer <TOKEN>
+on every request. May also be set via the
+.B MALUDB_MC2DBD_TOKEN
+environment variable.
+.TP
+.B \-\-foreground
+Run in the foreground (do not daemonize). This is the default mode
+used by the
+.B maludb-mc2dbd.service
+systemd unit.
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.B \-\-help
+Print usage and exit.
+.SH FILES
+.TP
+.I /etc/maludb/maludb-mc2dbd.conf
+Default configuration file, read by the systemd unit. Defines
+.BR HOST ", " PORT ", " PG_CONNINFO ", " MALUDB_MC2DBD_TOKEN .
+.TP
+.I /usr/lib/systemd/system/maludb-mc2dbd.service
+Hardened systemd unit (ProtectSystem=strict, RestrictAddressFamilies,
+etc.).
+.TP
+.I /etc/maludb/tls/server.crt
+.TQ
+.I /etc/maludb/tls/server.key
+Optional TLS material referenced by
+.BR \-\-tls-cert " and " \-\-tls-key .
+.SH ENVIRONMENT
+.TP
+.B MALUDB_MC2DBD_TOKEN
+Bearer token required on every request (alternative to
+.BR \-\-bearer-token ).
+.TP
+.BR PGHOST ", " PGDATABASE ", " PGUSER ", " PGPASSWORD
+Standard libpq fallbacks when
+.B \-\-pg-conninfo
+is not set.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal shutdown.
+.TP
+.B 2
+Invalid command-line arguments.
+.TP
+.B 3
+Configuration error (missing required option, malformed conninfo).
+.TP
+.B 4
+Could not bind the listener socket or initialize libmicrohttpd.
+.SH SEE ALSO
+.BR psql (1),
+.BR systemctl (1)
+.PP
+See
+.I /usr/share/doc/maludb-mc2dbd/README.Debian
+for post-install configuration steps, and
+.I /usr/share/maludb/scripts/maludb-validate
+for a post-install sanity check.
+.SH AUTHORS
+Edward Honour <ed@maludb.org>
+.SH BUGS
+Report issues at https://github.com/edward-honour/maludb-core/issues

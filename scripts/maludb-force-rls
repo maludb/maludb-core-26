@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# maludb-force-rls — operator opt-in for FORCE ROW LEVEL SECURITY.
+#
+# Per docs/security-review.md finding #1. By default, RLS on a
+# PostgreSQL table is bypassed by the table owner (and any role with
+# BYPASSRLS, including superuser). For deployments where the
+# extension owner MUST NOT see tenant rows — multi-tenant SaaS,
+# regulated environments, audit-isolation requirements — applying
+# `ALTER TABLE ... FORCE ROW LEVEL SECURITY` removes the owner-
+# bypass so the tenant_owner policy applies uniformly.
+#
+# This is opt-in by design. Most single-operator deployments do NOT
+# want it: with FORCE active, even maintenance queries from the
+# extension owner are filtered, so DDL paths that read every tenant's
+# rows (re-embedding, lifecycle batch jobs, derivation-ledger
+# replays) must SET ROLE to each tenant in turn, which is slow.
+#
+# Usage:
+#   scripts/maludb-force-rls --status      # list current state
+#   scripts/maludb-force-rls --apply       # turn FORCE on
+#   scripts/maludb-force-rls --revert      # turn FORCE off
+#
+# --apply and --revert are idempotent; re-running is safe.
+#
+# Scope: only Stage 2+ governed-object tables — i.e., tables with a
+# tenant_owner policy AND RLS already enabled. Tier-A catalog
+# (object_type, relationship_type, source_type) is intentionally not
+# tenant-scoped and is excluded.
+
+set -euo pipefail
+
+DB_NAME="${DB_NAME:-maludb}"
+PG_BIN="${PG_BIN:-/usr/lib/postgresql/17/bin}"
+
+cmd="${1:-}"
+case "$cmd" in
+    --status|--apply|--revert) ;;
+    ""|--help|-h)
+        sed -n '2,30p' "$0"
+        exit 0 ;;
+    *)
+        echo "unknown command: $cmd" >&2
+        echo "try --status, --apply, --revert, or --help" >&2
+        exit 2 ;;
+esac
+
+# Resolve the candidate set: tables in schema maludb_core with RLS
+# already enabled AND a tenant_owner policy attached. This guarantees
+# we never touch a table without the corresponding policy infra.
+CANDIDATES_SQL=$(cat <<'EOF'
+SELECT c.relname
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'maludb_core'
+   AND c.relkind = 'r'
+   AND c.relname LIKE 'malu$%'
+   AND c.relrowsecurity
+   AND EXISTS (
+        SELECT 1 FROM pg_policy p
+         WHERE p.polrelid = c.oid AND p.polname = 'tenant_owner')
+ ORDER BY c.relname
+EOF
+)
+
+q() { "${PG_BIN}/psql" -d "$DB_NAME" -tAc "$1"; }
+
+color()  { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+ok()     { color '32' "    ✓ $*"; }
+skip()   { color '36' "    · $*"; }
+hdr()    { echo; color '1;34' "==> $*"; }
+
+case "$cmd" in
+    --status)
+        hdr "FORCE RLS state for governed tables in $DB_NAME"
+        printf '%-40s  %s\n' "table" "force_row_security"
+        printf '%-40s  %s\n' "----------------------------------------" "------"
+        "${PG_BIN}/psql" -d "$DB_NAME" -tA -F '|' -c "
+SELECT c.relname,
+       CASE WHEN c.relforcerowsecurity THEN 'YES' ELSE 'no' END
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'maludb_core'
+   AND c.relkind = 'r'
+   AND c.relname LIKE 'malu\$%'
+   AND c.relrowsecurity
+   AND EXISTS (SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = c.oid AND p.polname = 'tenant_owner')
+ ORDER BY c.relname" \
+        | awk -F'|' '{ printf "%-40s  %s\n", $1, $2 }'
+        ;;
+    --apply)
+        hdr "Applying FORCE ROW LEVEL SECURITY"
+        applied=0
+        skipped=0
+        while IFS= read -r table; do
+            [ -z "$table" ] && continue
+            forced=$(q "SELECT relforcerowsecurity FROM pg_class c
+                         JOIN pg_namespace n ON n.oid=c.relnamespace
+                        WHERE n.nspname='maludb_core' AND c.relname='${table}'")
+            if [ "$forced" = "t" ]; then
+                skip "${table} already FORCE"
+                skipped=$((skipped+1))
+            else
+                q "ALTER TABLE maludb_core.\"${table}\" FORCE ROW LEVEL SECURITY" >/dev/null
+                ok "${table} → FORCE"
+                applied=$((applied+1))
+            fi
+        done < <(q "$CANDIDATES_SQL")
+        echo
+        echo "    applied=$applied, skipped=$skipped"
+        ;;
+    --revert)
+        hdr "Reverting FORCE ROW LEVEL SECURITY"
+        applied=0
+        skipped=0
+        while IFS= read -r table; do
+            [ -z "$table" ] && continue
+            forced=$(q "SELECT relforcerowsecurity FROM pg_class c
+                         JOIN pg_namespace n ON n.oid=c.relnamespace
+                        WHERE n.nspname='maludb_core' AND c.relname='${table}'")
+            if [ "$forced" = "f" ]; then
+                skip "${table} already not-FORCE"
+                skipped=$((skipped+1))
+            else
+                q "ALTER TABLE maludb_core.\"${table}\" NO FORCE ROW LEVEL SECURITY" >/dev/null
+                ok "${table} → NO FORCE"
+                applied=$((applied+1))
+            fi
+        done < <(q "$CANDIDATES_SQL")
+        echo
+        echo "    reverted=$applied, skipped=$skipped"
+        ;;
+esac

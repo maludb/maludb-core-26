@@ -1,0 +1,184 @@
+\set ECHO none
+maludb_public_enabled
+t
+(1 row)
+skill_a_enabled
+t
+(1 row)
+skill_b_enabled
+t
+(1 row)
+skill_schema_enabled_version_current
+t
+(1 row)
+skill_name|version
+sd_rank_exact_extract_transcript|1.0.0
+sd_rank_subject_only_transcript|1.0.0
+sd_rank_verb_only_extract|1.0.0
+sd_rank_keyword_only_action_items|1.0.0
+sd_rank_description_only_commitments|1.0.0
+(5 rows)
+search_rank|skill_name|owner_schema|match_kind
+1|sd_rank_exact_extract_transcript|skill_a|exact_subject_verb_keyword
+2|sd_rank_subject_only_transcript|skill_a|subject_only
+3|sd_rank_verb_only_extract|skill_a|verb_only
+4|sd_rank_keyword_only_action_items|skill_a|keyword_only
+5|sd_rank_description_only_commitments|skill_a|description_only
+(5 rows)
+subject_only_order
+t
+(1 row)
+verb_only_order
+t
+(1 row)
+keyword_only_order
+t
+(1 row)
+skill_name|owner_schema
+sd_rank_description_only_commitments|skill_a
+(1 row)
+search_rank|skill_name|owner_schema
+1|sd_rank_exact_extract_transcript|skill_a
+2|sd_rank_subject_only_transcript|skill_a
+(2 rows)
+skill_name|version
+sd_private_checklist_builder|1.0.0
+(1 row)
+skill_name|version
+sd_shared_readonly_checklist|1.0.0
+(1 row)
+skill_name|version
+sd_execute_only_hidden_skill|1.0.0
+sd_admin_only_hidden_skill|1.0.0
+(2 rows)
+private_skill_hidden
+t
+(1 row)
+direct_core_search_cannot_spoof_schema
+t
+(1 row)
+reserved_access_not_visible_or_forkable
+t
+(1 row)
+reserved_access_core_package_hidden
+t
+(1 row)
+reserved_access_core_grants_hidden
+t
+(1 row)
+skill_name|owner_schema|is_forkable
+sd_shared_readonly_checklist|skill_b|f
+(1 row)
+skill_name|owner_schema|is_forkable
+sd_shared_readonly_checklist|skill_b|t
+(1 row)
+skill_name|owner_schema|visibility
+sd_public_summary_skill|maludb_public|public
+(1 row)
+public_skill_excluded_when_public_disabled
+t
+(1 row)
+skill_name|owner_schema|is_public
+sd_public_summary_skill|maludb_public|t
+(1 row)
+tool_name|risk_class|read_only|function_signature
+skill.find|read_only|t|r10_skill_find(jsonb,jsonb)
+skill.fork|state_changing|f|r10_skill_fork(jsonb,jsonb)
+skill.get|read_only|t|r10_skill_get(jsonb,jsonb)
+(3 rows)
+mc2db_skill_required_args
+t
+(1 row)
+_begin_request
+
+(1 row)
+mc2db_find_called
+t
+(1 row)
+is_err|has_results|first_skill
+false|t|sd_public_summary_skill
+(1 row)
+_begin_request
+
+(1 row)
+mc2db_get_called
+t
+(1 row)
+is_err|skill_name|is_public
+false|sd_public_summary_skill|true
+(1 row)
+_begin_request
+
+(1 row)
+mc2db_fork_called
+t
+(1 row)
+is_err|forked_skill_id
+false|t
+(1 row)
+_begin_request
+
+(1 row)
+mc2db_find_missing_schema_called
+t
+(1 row)
+is_err|err_code|err_msg
+true|BAD_INPUT|requesting_schema is required
+(1 row)
+_begin_request
+
+(1 row)
+mc2db_get_missing_schema_called
+t
+(1 row)
+is_err|err_code|err_msg
+true|BAD_INPUT|requesting_schema is required
+(1 row)
+_begin_request
+
+(1 row)
+mc2db_fork_missing_target_called
+t
+(1 row)
+is_err|err_code|err_msg
+true|BAD_INPUT|target_owner_schema is required
+(1 row)
+skill_name|visibility
+sd_public_summary_skill|public
+(1 row)
+subject_name
+public document
+(1 row)
+verb_name
+summarize
+(1 row)
+keyword
+summarize
+(1 row)
+embedding_model|embedding_dim|source_text_kind
+sd-public-4d|4|description
+(1 row)
+grantee_role|access_level
+sd_user_b|read
+(1 row)
+skill_name|owner_schema|is_public
+sd_public_summary_skill|maludb_public|t
+(1 row)
+NOTICE:  OK: non-curator public skill write blocked
+NOTICE:  OK: non-curator public skill update blocked
+NOTICE:  OK: non-curator public skill delete blocked
+NOTICE:  OK: non-curator public keyword write blocked
+NOTICE:  OK: non-curator public keyword update blocked
+NOTICE:  OK: non-curator public keyword delete blocked
+NOTICE:  OK: non-curator public subject write blocked
+NOTICE:  OK: non-curator public subject update blocked
+NOTICE:  OK: non-curator public subject delete blocked
+NOTICE:  OK: non-curator public verb write blocked
+NOTICE:  OK: non-curator public verb update blocked
+NOTICE:  OK: non-curator public verb delete blocked
+NOTICE:  OK: non-curator public embedding write blocked
+NOTICE:  OK: non-curator public embedding update blocked
+NOTICE:  OK: non-curator public embedding delete blocked
+NOTICE:  OK: non-curator public access write blocked
+NOTICE:  OK: non-curator public access update blocked
+NOTICE:  OK: non-curator public access delete blocked

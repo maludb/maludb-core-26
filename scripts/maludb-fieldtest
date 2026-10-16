@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+# maludb-fieldtest — automated R1.0 field-test runner. Phase R1.0-10.
+#
+# Walks the 21-step acceptance procedure from
+# release-1.0-requirements.md §13 against an installed MaluDB host,
+# captures pass/fail per step, and writes a structured report.
+#
+# Assumes the host has already been bootstrapped (scripts/maludb-bootstrap
+# has run successfully). The runner does NOT install anything; it
+# exercises a working install end-to-end.
+#
+# Usage:
+#   scripts/maludb-fieldtest                      # listener via HTTP
+#   MC2DBD_URL=https://localhost:5329 \
+#     MC2DBD_INSECURE=1 \
+#     scripts/maludb-fieldtest                    # via HTTPS (self-signed)
+#   ALIAS=tiny scripts/maludb-fieldtest           # use a registered local model
+#   ALIAS=stub scripts/maludb-fieldtest           # use the deterministic stub
+#                                                 # (default; works without llama.cpp)
+#
+# Exit code: 0 if all PASS, 1 on any FAIL.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DB_NAME="${DB_NAME:-maludb}"
+ALIAS="${ALIAS:-stub}"
+MC2DBD_URL="${MC2DBD_URL:-http://127.0.0.1:5329}"
+TOKEN="${MC2DBD_TOKEN:-}"
+INSECURE="${MC2DBD_INSECURE:-0}"
+
+TS=$(date -u +"%Y%m%dT%H%M%SZ")
+OUT_DIR="${OUT_DIR:-/tmp/maludb-fieldtest-$TS}"
+REPORT_MD="$OUT_DIR/report.md"
+REPORT_JSON="$OUT_DIR/report.json"
+mkdir -p "$OUT_DIR"
+
+PASS=0; FAIL=0; WARN=0
+RESULTS=()
+
+color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+ok()    { color '32' "PASS  $*"; PASS=$((PASS+1)); RESULTS+=("PASS|$STEP|$*"); }
+ko()    { color '31' "FAIL  $*"; FAIL=$((FAIL+1)); RESULTS+=("FAIL|$STEP|$*"); }
+wn()    { color '33' "WARN  $*"; WARN=$((WARN+1)); RESULTS+=("WARN|$STEP|$*"); }
+banner(){ echo; color '1;34' "═══ Step $1: $2 ═══"; STEP="$1"; }
+
+require() {
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || { echo "missing: $c"; exit 2; }
+    done
+}
+require psql jq curl
+
+q() {
+    local sp="-c search_path=maludb_core,public"
+    if [ -n "${PG_CONNINFO:-}" ]; then
+        PGOPTIONS="$sp" psql -X -q -t -A -F $'\t' -v ON_ERROR_STOP=1 "$PG_CONNINFO" -c "$1"
+    else
+        PGOPTIONS="$sp" psql -X -q -t -A -F $'\t' -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "$1"
+    fi
+}
+
+curl_post() {
+    local args=(-fsS)
+    [ "$INSECURE" = "1" ] && args+=(-k)
+    args+=(-H "Content-Type: application/json")
+    [ -n "$TOKEN" ] && args+=(-H "Authorization: Bearer $TOKEN")
+    curl "${args[@]}" -X POST "$MC2DBD_URL/" -d "$1"
+}
+
+curl_get() {
+    local args=(-fsS)
+    [ "$INSECURE" = "1" ] && args+=(-k)
+    curl "${args[@]}" "$MC2DBD_URL$1"
+}
+
+call_tool() {
+    local name=$1 args_json=$2 id=${3:-1}
+    curl_post "$(jq -nc \
+        --arg n "$name" --argjson a "$args_json" --argjson id "$id" \
+        '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:$n,arguments:$a}}')"
+}
+
+cap() {
+    local name=$1 content=$2
+    printf '%s' "$content" > "$OUT_DIR/$name"
+}
+
+# ---------------------------------------------------------------------
+# 0. Header
+# ---------------------------------------------------------------------
+echo "MaluDB R1.0 field test"
+echo "  host:     $(hostname)"
+echo "  date:     $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+echo "  commit:   $(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "(not a git repo)")"
+echo "  alias:    $ALIAS"
+echo "  url:      $MC2DBD_URL"
+echo "  out_dir:  $OUT_DIR"
+
+# ---------------------------------------------------------------------
+# 1. Provisioning (assumed already done by bootstrap)
+# ---------------------------------------------------------------------
+banner 1 "Provisioning preflight"
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    if [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_ID:-}" = "24.04" ]; then
+        ok "Ubuntu 24.04 detected"
+    else
+        wn "Detected ${PRETTY_NAME:-unknown}; R1.0 targets Ubuntu 24.04"
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# 2. MaluDB installed
+# ---------------------------------------------------------------------
+banner 2 "MaluDB installed"
+EXTVER=$(q "SELECT extversion FROM pg_extension WHERE extname='maludb_core'" 2>/dev/null || true)
+if [ -n "$EXTVER" ]; then
+    ok "maludb_core ${EXTVER} active in ${DB_NAME}"
+else
+    ko "maludb_core not installed in ${DB_NAME}"
+    echo "Run: sudo scripts/maludb-bootstrap"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# 3. PG 17, pgvector, maludb_core
+# ---------------------------------------------------------------------
+banner 3 "PostgreSQL 17, pgvector, maludb_core"
+PG_VER=$(q "SELECT current_setting('server_version')")
+PG_MAJOR=${PG_VER%%.*}
+[ "$PG_MAJOR" = "17" ] && ok "PG ${PG_VER}" || ko "PG major ${PG_MAJOR} (want 17)"
+VEC_VER=$(q "SELECT extversion FROM pg_extension WHERE extname='vector'")
+[ -n "$VEC_VER" ] && ok "pgvector ${VEC_VER}" || ko "pgvector missing"
+ok "maludb_core $EXTVER"
+
+# ---------------------------------------------------------------------
+# 4. GPU readiness
+# ---------------------------------------------------------------------
+banner 4 "GPU readiness"
+if "$REPO_ROOT/scripts/maludb-gpu-check" --quiet >/dev/null 2>&1; then
+    ok "GPU readiness check passed"
+else
+    wn "no GPU detected — local_runtime steps will run on CPU or rely on the stub adapter"
+fi
+
+# ---------------------------------------------------------------------
+# 5. Local model registered
+# ---------------------------------------------------------------------
+banner 5 "Local model alias '${ALIAS}' registered"
+ALIAS_KIND=$(q "
+SELECT mp.provider_kind
+FROM maludb_core.malu\$model_alias ma
+JOIN maludb_core.malu\$model_provider mp ON mp.provider_id = ma.provider_id
+WHERE ma.alias_name = '${ALIAS}'" 2>/dev/null || true)
+if [ -z "$ALIAS_KIND" ]; then
+    if [ "$ALIAS" = "stub" ]; then
+        # Auto-register a stub provider/alias for the runner.
+        if q "
+SELECT register_model_provider('fieldtest-stub','stub','stub','SECRET','internal');
+SELECT register_model_alias('stub','fieldtest-stub','stub-1');
+" >/dev/null 2>&1; then
+            ALIAS_KIND=stub
+            ok "auto-registered stub provider+alias"
+        else
+            ko "auto-register of stub provider/alias failed"
+            exit 1
+        fi
+    else
+        ko "alias '${ALIAS}' not registered. See install.md §7 to register a local model."
+        exit 1
+    fi
+else
+    ok "alias ${ALIAS} resolves to provider_kind=${ALIAS_KIND}"
+fi
+
+# Ensure a prompt template exists for the runner
+if q "SELECT 1 FROM malu\$prompt_template WHERE template_name='fieldtest-greet'" \
+        | grep -q '^1$'; then
+    ok "prompt template fieldtest-greet exists"
+else
+    if q "SELECT register_prompt_template('fieldtest-greet','Say hi to :name in one sentence.')" \
+            >/dev/null 2>&1; then
+        ok "prompt template fieldtest-greet registered"
+    else
+        ko "register_prompt_template failed"
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# 6. maludb_modeld running (only required for non-stub aliases)
+# ---------------------------------------------------------------------
+banner 6 "maludb_modeld service"
+if [ "$ALIAS_KIND" = "stub" ]; then
+    wn "stub adapter doesn't need maludb_modeld (handled inline by listener)"
+else
+    if systemctl is-active --quiet maludb-modeld; then
+        ok "maludb-modeld active"
+    else
+        ko "maludb-modeld not running. Start with: sudo systemctl start maludb-modeld"
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# 7-11. Direct DB pipeline: account → session → context → render → submit → response
+# ---------------------------------------------------------------------
+banner 7 "Direct DB pipeline (no listener)"
+ACCT="fieldtest_${TS}"
+PIPE_OUT=$(q "
+INSERT INTO maludb_core.malu\$account(account_name, account_kind) VALUES ('${ACCT}','human');
+SELECT start_session('${ACCT}','${ALIAS}','fieldtest-greet') AS session_id;
+" 2>&1) || { ko "direct DB pipeline failed at start_session: $PIPE_OUT"; exit 1; }
+SID=$(echo "$PIPE_OUT" | tail -n1)
+ok "session_id=$SID via direct DB call"
+
+q "SELECT append_context($SID,'system','be terse');" >/dev/null
+q "SELECT append_context($SID,'user',  'about the field test');" >/dev/null
+ok "two context blocks appended"
+
+RID=$(q "SELECT render_prompt($SID,'fieldtest-greet',NULL,'{\"name\":\"world\"}'::jsonb)")
+ok "render_id=$RID"
+
+REQ=$(q "SELECT submit_render($RID,'${ALIAS}','${ACCT}')")
+ok "request_id=$REQ submitted"
+
+# Drain the request: stub is sync; local_runtime is async (modeld picks up)
+if [ "$ALIAS_KIND" = "stub" ]; then
+    q "SELECT mc_stub_process($REQ)" >/dev/null
+fi
+RESP_STATUS=""
+for i in $(seq 1 24); do
+    RESP_STATUS=$(q "SELECT status FROM maludb_core.malu\$model_response WHERE request_id=$REQ")
+    [ -n "$RESP_STATUS" ] && break
+    sleep 5
+done
+if [ "$RESP_STATUS" = "succeeded" ]; then
+    ok "response status=succeeded after $((i*5))s"
+    RESP_TEXT=$(q "SELECT length(output_text), finish_reason, adapter_name
+                   FROM maludb_core.malu\$model_response WHERE request_id=$REQ")
+    ok "response: $RESP_TEXT"
+elif [ -n "$RESP_STATUS" ]; then
+    ko "response status=$RESP_STATUS (expected succeeded)"
+else
+    ko "no response after 120s"
+fi
+cap "step11.response.txt" "$(q "SELECT output_text FROM maludb_core.malu\$model_response WHERE request_id=$REQ" | head -c 4096)"
+
+# ---------------------------------------------------------------------
+# 12. maludb_mc2dbd running
+# ---------------------------------------------------------------------
+banner 12 "maludb_mc2dbd service"
+if systemctl is-active --quiet maludb-mc2dbd; then
+    ok "maludb-mc2dbd active"
+elif curl_get /healthz >/dev/null 2>&1; then
+    ok "listener reachable at $MC2DBD_URL (not via systemd)"
+else
+    ko "listener not reachable at $MC2DBD_URL"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# 13. Connect to listener
+# ---------------------------------------------------------------------
+banner 13 "Connect to ${MC2DBD_URL}"
+if curl_get /healthz | grep -q '^ok$'; then
+    ok "/healthz returns ok"
+else
+    ko "/healthz did not return ok"
+fi
+
+# ---------------------------------------------------------------------
+# 14. MCP initialize
+# ---------------------------------------------------------------------
+banner 14 "MCP initialize"
+INIT=$(curl_post '{"jsonrpc":"2.0","id":1,"method":"initialize"}')
+cap step14.initialize.json "$INIT"
+if echo "$INIT" | jq -e '.result.serverInfo.name=="maludb_mc2dbd"
+                       and .result.protocolVersion=="2025-11-25"' >/dev/null; then
+    ok "initialize: serverInfo.name=maludb_mc2dbd, protocolVersion=2025-11-25"
+else
+    ko "initialize wrong: $INIT"
+fi
+
+# ---------------------------------------------------------------------
+# 15. tools/list
+# ---------------------------------------------------------------------
+banner 15 "tools/list"
+TOOLS=$(curl_post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+cap step15.tools-list.json "$TOOLS"
+TCNT=$(echo "$TOOLS" | jq '.result.tools | length')
+[ "$TCNT" = "14" ] && ok "14 tools advertised (13 R1.0 + 1 R1.1)" || ko "expected 14 tools, got $TCNT"
+
+# ---------------------------------------------------------------------
+# 16. context.append + context.read via listener
+# ---------------------------------------------------------------------
+banner 16 "Session Context through MC2DB"
+S2=$(call_tool maludb.sessions.create \
+    "$(jq -nc --arg a "$ACCT" --arg al "$ALIAS" --arg t fieldtest-greet \
+       '{account_name:$a,alias_name:$al,template_name:$t}')" 16 \
+    | jq '.result.structuredContent.session_id')
+[ -n "$S2" ] && ok "sessions.create → session_id=$S2" || { ko "sessions.create failed"; S2=null; }
+
+call_tool maludb.context.append \
+    "$(jq -nc --argjson s "$S2" '{session_id:$s,role:"system",content_text:"fieldtest"}')" 16 \
+    >/dev/null && ok "context.append OK" || ko "context.append failed"
+
+CB=$(call_tool maludb.context.read \
+    "$(jq -nc --argjson s "$S2" '{session_id:$s}')" 16 \
+    | jq '.result.structuredContent.blocks | length')
+[ "$CB" -ge 1 ] && ok "context.read returned $CB block(s)" || ko "context.read returned $CB"
+
+# ---------------------------------------------------------------------
+# 17. models.submit through MC2DB
+# ---------------------------------------------------------------------
+banner 17 "models.submit through MC2DB"
+R2=$(call_tool maludb.prompts.render \
+    "$(jq -nc --argjson s "$S2" --arg t fieldtest-greet \
+       '{session_id:$s,template_name:$t,variables:{name:"MC2DB"}}')" 17 \
+    | jq '.result.structuredContent.render_id')
+ok "prompts.render → render_id=$R2"
+
+SUBMIT=$(call_tool maludb.models.submit \
+    "$(jq -nc --argjson r "$R2" --arg al "$ALIAS" \
+       '{render_id:$r,alias_name:$al}')" 17)
+cap step17.submit.json "$SUBMIT"
+RQ2=$(echo "$SUBMIT" | jq '.result.structuredContent.request_id')
+PK2=$(echo "$SUBMIT" | jq -r '.result.structuredContent.provider_kind')
+ok "models.submit → request_id=$RQ2, provider_kind=$PK2"
+
+# ---------------------------------------------------------------------
+# 18. responses.get through MC2DB
+# ---------------------------------------------------------------------
+banner 18 "responses.get through MC2DB"
+GOT=""
+for i in $(seq 1 24); do
+    GOT=$(call_tool maludb.responses.get \
+        "$(jq -nc --argjson r "$RQ2" '{request_id:$r}')" 18)
+    P=$(echo "$GOT" | jq -r '.result.structuredContent.pending')
+    [ "$P" = "false" ] && break
+    sleep 5
+done
+cap step18.response.json "$GOT"
+if echo "$GOT" | jq -e '.result.structuredContent.pending == false
+                      and .result.structuredContent.response.status == "succeeded"' >/dev/null; then
+    ok "responses.get returned succeeded"
+else
+    ko "responses.get failed: $(echo "$GOT" | jq -c '.result.structuredContent | {pending, response: (.response // null) | (if . then {status, finish_reason} else null end)}')"
+fi
+
+# ---------------------------------------------------------------------
+# 19. Audit records
+# ---------------------------------------------------------------------
+banner 19 "Audit records"
+AUD=$(q "
+SELECT count(*)::text || ' rows' FROM maludb_core.malu\$mc2db_invocation
+WHERE started_at > now() - interval '1 hour'")
+ok "malu\$mc2db_invocation: $AUD in the last hour"
+
+# ---------------------------------------------------------------------
+# 20. No Stage 2+ memory objects
+# ---------------------------------------------------------------------
+banner 20 "Stage boundary"
+SBV=$(q "SELECT count(*) FROM maludb_core.stage_boundary_violations()")
+[ "$SBV" = "0" ] && ok "no Stage 2+ memory objects installed" \
+                 || ko "stage boundary violated: $SBV"
+
+# ---------------------------------------------------------------------
+# 21. Wired dispatchers — seed tools surface real runtime errors
+#
+# R1.1-1 wired external_exec; R1.1-2 wired mcp_proxy. The exemplar
+# seed tools point at paths/endpoints that don't exist on a fresh box,
+# so they now surface INTERNAL_ERROR (missing binary) and UPSTREAM_ERROR
+# (connection refused) instead of the old IMPL_TYPE_NOT_AVAILABLE
+# rejection.
+# ---------------------------------------------------------------------
+banner 21 "Wired dispatchers — seed tools fail closed with real errors"
+EX=$(call_tool maludb.r10.external_exec_demo '{}' 21)
+if echo "$EX" | jq -e '.result.isError==true
+                     and .result._meta.error_code=="INTERNAL_ERROR"
+                     and (.result.content[0].text | contains("external_exec command not executable"))' >/dev/null; then
+    ok "external_exec exemplar fails closed on missing binary (R1.1-1 wired)"
+else
+    ko "external_exec rejection wrong: $EX"
+fi
+PX=$(call_tool maludb.r10.mcp_proxy_demo '{}' 21)
+if echo "$PX" | jq -e '.result.isError==true
+                     and .result._meta.error_code=="UPSTREAM_ERROR"' >/dev/null; then
+    ok "mcp_proxy exemplar fails closed with UPSTREAM_ERROR (R1.1-2 wired)"
+else
+    ko "mcp_proxy rejection wrong: $PX"
+fi
+
+# ---------------------------------------------------------------------
+# Final report
+# ---------------------------------------------------------------------
+echo
+TOTAL=$((PASS+WARN+FAIL))
+{
+    echo "# MaluDB R1.0 Field Test Report"
+    echo
+    echo "- Host: $(hostname)"
+    echo "- Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "- Commit: $(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "?")"
+    echo "- Alias: $ALIAS  (provider_kind=$ALIAS_KIND)"
+    echo "- Listener: $MC2DBD_URL"
+    echo
+    echo "## Summary"
+    echo
+    echo "| Result | Count |"
+    echo "|---|---|"
+    echo "| PASS | $PASS |"
+    echo "| WARN | $WARN |"
+    echo "| FAIL | $FAIL |"
+    echo "| Total | $TOTAL |"
+    echo
+    echo "## Per-step results"
+    echo
+    echo "| Step | Result | Detail |"
+    echo "|---|---|---|"
+    for r in "${RESULTS[@]}"; do
+        IFS='|' read -r kind step msg <<<"$r"
+        printf "| %s | %s | %s |\n" "$step" "$kind" "$msg"
+    done
+} > "$REPORT_MD"
+
+# JSON
+{
+    printf '{"host":"%s","date":"%s","commit":"%s","alias":"%s","alias_kind":"%s","url":"%s",' \
+        "$(hostname)" "$(date -u +%FT%TZ)" \
+        "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)" "$ALIAS" "$ALIAS_KIND" "$MC2DBD_URL"
+    printf '"pass":%d,"warn":%d,"fail":%d,"total":%d,"results":[' "$PASS" "$WARN" "$FAIL" "$TOTAL"
+    sep=""
+    for r in "${RESULTS[@]}"; do
+        IFS='|' read -r kind step msg <<<"$r"
+        printf '%s{"step":"%s","kind":"%s","message":%s}' \
+            "$sep" "$step" "$kind" "$(jq -Rn --arg m "$msg" '$m')"
+        sep=","
+    done
+    printf "]}\n"
+} > "$REPORT_JSON"
+
+if [ "$FAIL" -eq 0 ]; then
+    color '32' "Field test PASSED: ${PASS} pass / ${WARN} warn / ${FAIL} fail (${TOTAL} steps)"
+    color '36' "Report: $REPORT_MD"
+    exit 0
+else
+    color '31' "Field test FAILED: ${PASS} pass / ${WARN} warn / ${FAIL} fail (${TOTAL} steps)"
+    color '36' "Report: $REPORT_MD"
+    exit 1
+fi

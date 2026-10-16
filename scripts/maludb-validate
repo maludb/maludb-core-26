@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# maludb-validate — post-install acceptance check for MaluDB R1.0.
+# Phase R1.0-9.
+#
+# Exercises every step from release-1.0-requirements.md §13 against a
+# running install. Designed to be run by an operator after
+# scripts/maludb-bootstrap or by CI in a smoke job.
+#
+# Usage:
+#   scripts/maludb-validate                  # against the system install
+#   PG_CONNINFO=...  scripts/maludb-validate
+#   MC2DBD_URL=http://127.0.0.1:5329  scripts/maludb-validate
+#
+# Exit code: 0 if all PASS (warnings allowed), 1 on any FAIL.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PSQL=psql
+DB_NAME="${DB_NAME:-maludb}"
+DB_USER="${DB_USER:-${USER:-maludb}}"
+PG_CONNINFO="${PG_CONNINFO:-}"
+MC2DBD_URL="${MC2DBD_URL:-http://127.0.0.1:5329}"
+TOKEN="${MC2DBD_TOKEN:-}"
+SKIP_LISTENER="${SKIP_LISTENER:-0}"
+
+PASS=0; WARN=0; FAIL=0
+FAILED=()
+
+color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+ok()    { color '32' "PASS  $*"; PASS=$((PASS+1)); }
+wn()    { color '33' "WARN  $*"; WARN=$((WARN+1)); }
+ko()    { color '31' "FAIL  $*"; FAIL=$((FAIL+1)); FAILED+=("$*"); }
+
+require() {
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || { ko "missing tool: $cmd"; return 1; }
+    done
+}
+require psql jq curl openssl || exit 1
+
+probe_q_mode() {
+    # Decide once how to talk to PG. Three fallbacks, tried in order:
+    #   1. direct  — psql -d $DB_NAME (works if invoking user has a PG role)
+    #   2. sudo    — sudo -n -u postgres psql -d $DB_NAME (needs NOPASSWD sudo)
+    #   3. PG_CONNINFO — explicit override always wins.
+    Q_MODE=""
+    if [ -n "$PG_CONNINFO" ]; then
+        Q_MODE=conninfo
+    elif "$PSQL" -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
+        Q_MODE=direct
+    elif sudo -n -u postgres "$PSQL" -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
+        Q_MODE=sudo
+    else
+        Q_MODE=fail
+    fi
+}
+probe_q_mode
+
+q() {
+    case "$Q_MODE" in
+        conninfo) "$PSQL" -X -q -t -A -v ON_ERROR_STOP=1 "$PG_CONNINFO" -c "$1" ;;
+        direct)   "$PSQL" -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME"     -c "$1" ;;
+        sudo)     sudo -n -u postgres "$PSQL" -X -q -t -A -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "$1" ;;
+        *)        return 1 ;;
+    esac
+}
+
+curl_post() {
+    local hdrs=(-H "Content-Type: application/json")
+    [ -n "$TOKEN" ] && hdrs+=(-H "Authorization: Bearer $TOKEN")
+    curl -fsS "${hdrs[@]}" -X POST "$MC2DBD_URL/" -d "$1"
+}
+
+# ---------------------------------------------------------------------
+# 1. PostgreSQL reachable
+# ---------------------------------------------------------------------
+if [ "$Q_MODE" = "fail" ]; then
+    ko "cannot reach PostgreSQL: tried direct (peer-auth as $USER), sudo -u postgres, and PG_CONNINFO env"
+    cat >&2 <<EOM
+    Hints:
+      - Run as a user with a matching PG role: sudo -u maludb_mc2dbd ./scripts/maludb-validate
+      - Or set PG_CONNINFO: PG_CONNINFO='host=/var/run/postgresql user=maludb_mc2dbd dbname=maludb' ./scripts/maludb-validate
+      - Or grant your OS user a PG role: sudo -u postgres psql -c "CREATE ROLE $USER LOGIN; GRANT CONNECT ON DATABASE $DB_NAME TO $USER;"
+EOM
+    exit 1
+fi
+VER=$(q "SELECT version()")
+ok "PostgreSQL reachable via Q_MODE=$Q_MODE ($(echo "$VER" | head -c 60)...)"
+
+# ---------------------------------------------------------------------
+# 2. maludb_core extension installed
+# ---------------------------------------------------------------------
+EXTVER=$(q "SELECT extversion FROM pg_extension WHERE extname='maludb_core'" 2>/dev/null || true)
+if [ -n "$EXTVER" ]; then
+    ok "maludb_core ${EXTVER} installed"
+else
+    ko "maludb_core extension not installed in database ${DB_NAME}"
+fi
+
+# ---------------------------------------------------------------------
+# 2b. database version matches the host's extension files. A stale
+#     working tree's `make install` silently downgrades default_version
+#     for the whole host: fresh CREATE EXTENSION then lands on an old
+#     version, and upgraded vs fresh databases diverge ("relation ...
+#     does not exist" bugs). Catch the skew here.
+# ---------------------------------------------------------------------
+SHAREDIR=$(pg_config --sharedir 2>/dev/null || true)
+[ -d "${SHAREDIR}/extension" ] || SHAREDIR=/usr/share/postgresql/17
+CONTROL="${SHAREDIR}/extension/maludb_core.control"
+if [ -n "$EXTVER" ] && [ -r "$CONTROL" ]; then
+    HOSTVER=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" "$CONTROL")
+    if [ "$EXTVER" = "$HOSTVER" ]; then
+        ok "database version matches host extension files (${HOSTVER})"
+    else
+        ko "version skew: database has ${EXTVER}, host extension files declare ${HOSTVER} — run ALTER EXTENSION maludb_core UPDATE (db behind) or reinstall from the current checkout (host files stale)"
+    fi
+    # Per-tenant facades lag behind until re-enabled (a migration cannot
+    # replace tenant-owned objects). Surface schemas needing a refresh.
+    STALE_SCHEMAS=$(q "SELECT string_agg(schema_name || ' (' || enabled_version || ')', ', ')
+                         FROM maludb_core.malu\$enabled_schema
+                        WHERE enabled_version <> '${EXTVER}'" 2>/dev/null || true)
+    if [ -n "$STALE_SCHEMAS" ]; then
+        wn "memory schemas on an older facade version: ${STALE_SCHEMAS} — re-run maludb_core.enable_memory_schema(schema) for each"
+    else
+        ok "all memory-enabled schemas are on ${EXTVER}"
+    fi
+elif [ -n "$EXTVER" ]; then
+    wn "cannot read ${CONTROL} to cross-check the installed version"
+fi
+
+# ---------------------------------------------------------------------
+# 3. pgvector demo query works
+# ---------------------------------------------------------------------
+DEMO_OK=$(q "
+SELECT (
+    SELECT count(*) FROM maludb_core.malu\$vector_demo
+) >= 0 AS demo_table_present" 2>/dev/null || true)
+if [ "$DEMO_OK" = "t" ]; then
+    ok "pgvector demo table reachable"
+else
+    ko "pgvector demo unreachable"
+fi
+DEMO_QRY=$(q "
+SELECT label
+FROM maludb_core.malu\$vector_demo
+ORDER BY embedding <=> '[0,0,0,0,0,0,0,0]'::vector
+LIMIT 1" 2>/dev/null || true)
+if [ -n "$DEMO_QRY" ]; then
+    ok "pgvector cosine query returns: ${DEMO_QRY}"
+else
+    wn "pgvector demo table empty (R1.0-1 seeds none; ok if no rows inserted)"
+fi
+
+# ---------------------------------------------------------------------
+# 3a. pgaudit preload (per docs/security-review.md finding #3)
+# ---------------------------------------------------------------------
+PRELOAD=$(q "SHOW shared_preload_libraries" 2>/dev/null || true)
+if [[ ",${PRELOAD}," == *",pgaudit,"* ]]; then
+    ok "pgaudit present in shared_preload_libraries"
+else
+    wn "pgaudit NOT preloaded — re-run scripts/maludb-bootstrap"
+fi
+
+PGAUDIT_LOG=$(q "SHOW pgaudit.log" 2>/dev/null || true)
+if [ -n "$PGAUDIT_LOG" ] && [ "$PGAUDIT_LOG" != "none" ]; then
+    ok "pgaudit.log = '${PGAUDIT_LOG}'"
+else
+    wn "pgaudit.log unset or 'none' — governance audit logs will be empty"
+fi
+
+# ---------------------------------------------------------------------
+# 4. GPU readiness (warn-only)
+# ---------------------------------------------------------------------
+if [ -x "$REPO_ROOT/scripts/maludb-gpu-check" ]; then
+    if "$REPO_ROOT/scripts/maludb-gpu-check" --quiet >/dev/null 2>&1; then
+        ok "GPU readiness check passed"
+    else
+        wn "no GPU detected — CPU acceptance path is valid for R1.0 (use a small Q4 model)"
+    fi
+else
+    wn "scripts/maludb-gpu-check not found"
+fi
+
+# ---------------------------------------------------------------------
+# 5. Local runtime check (warn-only)
+# ---------------------------------------------------------------------
+if [ -x "$REPO_ROOT/scripts/maludb-model-runtime-check" ]; then
+    if "$REPO_ROOT/scripts/maludb-model-runtime-check" --mode=stub --quiet >/dev/null 2>&1; then
+        ok "model runtime stub mode functional"
+    else
+        wn "model runtime stub check failed"
+    fi
+else
+    wn "scripts/maludb-model-runtime-check not found"
+fi
+
+# ---------------------------------------------------------------------
+# 6. R1.0-8 + R1.1-14 + 0.73.0 catalog: 17 tools registered under
+#    maludb.r10 (13 from R1.0-8 + maludb.memory.search.exact from
+#    R1.1-14 + skill.find/skill.get/skill.fork from 0.73.0)
+# ---------------------------------------------------------------------
+TOOL_COUNT=$(q "
+SELECT count(*) FROM maludb_core.malu\$mc2db_tool t
+JOIN maludb_core.malu\$mc2db_server s USING (server_id)
+WHERE s.server_name='maludb.r10'" 2>/dev/null || echo 0)
+if [ "$TOOL_COUNT" = "17" ]; then
+    ok "17 maludb.r10 tools registered (13 R1.0 + 1 R1.1 + 3 skill discovery)"
+else
+    ko "expected 17 tools under maludb.r10, found $TOOL_COUNT"
+fi
+
+# ---------------------------------------------------------------------
+# 7. Stage boundary: no Stage 2+ memory objects
+# ---------------------------------------------------------------------
+SB_VIOL=$(q "SELECT count(*) FROM maludb_core.stage_boundary_violations()" 2>/dev/null || echo X)
+if [ "$SB_VIOL" = "0" ]; then
+    ok "stage boundary clean (no Stage 2+ memory objects installed)"
+else
+    ko "stage boundary violated: $SB_VIOL Stage 2+ tables present"
+fi
+
+# ---------------------------------------------------------------------
+# 8. End-to-end pipeline against the stub adapter (no listener needed)
+# ---------------------------------------------------------------------
+E2E=$(q "
+SET search_path TO maludb_core, public;
+DO \$\$
+DECLARE
+    v_account text := 'r10_validate_$(date +%s)';
+    v_session bigint;
+    v_render  bigint;
+    v_request bigint;
+    v_response_id bigint;
+BEGIN
+    INSERT INTO malu\$account(account_name, account_kind) VALUES (v_account,'human');
+    -- ensure a stub provider+alias exist
+    IF NOT EXISTS (SELECT 1 FROM malu\$model_provider WHERE provider_name='r10_validate_stub') THEN
+        PERFORM register_model_provider('r10_validate_stub','stub','stub','SECRET','internal');
+        PERFORM register_model_alias('r10_validate_alias','r10_validate_stub','stub-1');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM malu\$prompt_template WHERE template_name='r10_validate_tmpl') THEN
+        PERFORM register_prompt_template('r10_validate_tmpl','Hello {{who}}!');
+    END IF;
+    v_session := start_session(v_account,'r10_validate_alias','r10_validate_tmpl');
+    PERFORM append_context(v_session,'system','be terse');
+    v_render := render_prompt(v_session,'r10_validate_tmpl',NULL,'{\"who\":\"world\"}'::jsonb);
+    v_request := submit_render(v_render,'r10_validate_alias',v_account);
+    v_response_id := mc_stub_process(v_request);
+    IF v_response_id IS NULL THEN RAISE EXCEPTION 'no response'; END IF;
+END
+\$\$;
+SELECT 'e2e_ok'" 2>/dev/null || true)
+if [ "$E2E" = "e2e_ok" ]; then
+    ok "end-to-end stub pipeline (account → session → context → render → submit → response)"
+else
+    ko "end-to-end stub pipeline failed"
+fi
+
+# ---------------------------------------------------------------------
+# 9. MC2DB listener tests (optional: SKIP_LISTENER=1 to bypass)
+# ---------------------------------------------------------------------
+if [ "$SKIP_LISTENER" = "1" ]; then
+    wn "listener checks skipped (SKIP_LISTENER=1)"
+else
+    if curl -fsS --max-time 5 "${MC2DBD_URL}/healthz" >/dev/null 2>&1; then
+        ok "listener /healthz reachable at ${MC2DBD_URL}"
+
+        RESP=$(curl_post '{"jsonrpc":"2.0","id":1,"method":"initialize"}' 2>/dev/null || echo "")
+        if echo "$RESP" | jq -e '.result.serverInfo.name=="maludb_mc2dbd"' >/dev/null 2>&1; then
+            ok "MCP initialize succeeds (serverInfo.name=maludb_mc2dbd)"
+        else
+            ko "MCP initialize failed: $RESP"
+        fi
+
+        RESP=$(curl_post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>/dev/null || echo "")
+        N=$(echo "$RESP" | jq '[.result.tools[] | select(.name|startswith("maludb."))] | length' 2>/dev/null || echo 0)
+        if [ "$N" -ge 11 ]; then
+            ok "tools/list advertises ${N} maludb.* tools"
+        else
+            ko "tools/list returned only ${N} maludb.* tools (expected ≥11)"
+        fi
+
+        RESP=$(curl_post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"maludb.health","arguments":{}}}' 2>/dev/null || echo "")
+        if echo "$RESP" | jq -e '.result.isError==false and .result.structuredContent.status=="ok"' >/dev/null 2>&1; then
+            ok "tools/call maludb.health → status=ok"
+        else
+            ko "maludb.health call failed: $RESP"
+        fi
+    else
+        wn "listener not running at ${MC2DBD_URL} (start with: sudo systemctl start maludb-mc2dbd)"
+    fi
+fi
+
+# ---------------------------------------------------------------------
+echo
+TOTAL=$((PASS+WARN+FAIL))
+if [ "$FAIL" -eq 0 ]; then
+    color '32' "Validation OK: ${PASS} pass / ${WARN} warn / ${FAIL} fail (${TOTAL} checks)"
+    exit 0
+else
+    color '31' "Validation FAILED: ${PASS} pass / ${WARN} warn / ${FAIL} fail (${TOTAL} checks)"
+    for m in "${FAILED[@]}"; do echo "  - $m"; done
+    exit 1
+fi

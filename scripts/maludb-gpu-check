@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# maludb-gpu-check — probe Ubuntu host GPU readiness for MaluDB R1.0.
+#
+# Returns 0 when an NVIDIA GPU + driver are visible and usable.
+# Returns 1 when no usable GPU is detected and --dev was not given.
+# With --dev, missing GPU is reported as a warning and the script exits 0,
+# but the host is explicitly flagged NOT field-test ready.
+
+set -euo pipefail
+
+DEV_MODE=0
+QUIET=0
+JSON=0
+
+usage() {
+    cat <<'USAGE'
+Usage: maludb-gpu-check [--dev] [--quiet] [--json]
+
+Probes the host for an NVIDIA CUDA-capable GPU usable by the local model
+runtime. Returns 0 when a GPU is detected, non-zero otherwise (unless
+--dev is supplied, in which case CPU-only hosts also exit 0 with a
+warning).
+
+  --dev    Treat missing GPU as a warning and exit 0. The host is
+           reported as NOT field-test ready.
+  --quiet  Suppress informational output (errors and warnings still go
+           to stderr).
+  --json   Emit a single-line JSON status object on stdout instead of
+           human-readable text.
+  -h, --help
+           Show this help.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dev)   DEV_MODE=1; shift ;;
+        --quiet) QUIET=1; shift ;;
+        --json)  JSON=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "maludb-gpu-check: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+log()  { [[ $QUIET -eq 0 && $JSON -eq 0 ]] && echo "$*"; return 0; }
+warn() { echo "WARN: $*" >&2; }
+fail() { echo "FAIL: $*" >&2; }
+
+emit_json() {
+    # $1 status (ok|warn|fail), $2 reason, $3 gpu_name, $4 driver
+    printf '{"status":"%s","field_test_ready":%s,"reason":"%s","gpu":"%s","driver":"%s"}\n' \
+        "$1" "$2" "${3:-}" "${4:-}" "${5:-}"
+}
+
+# 1) nvidia-smi is the canonical readiness probe on Ubuntu PGDG hosts.
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    if [[ $DEV_MODE -eq 1 ]]; then
+        if [[ $JSON -eq 1 ]]; then
+            emit_json "warn" "false" "nvidia-smi not found; CPU-only dev mode"
+        else
+            warn "nvidia-smi not found — CPU-only dev mode (NOT field-test ready)"
+        fi
+        exit 0
+    fi
+    if [[ $JSON -eq 1 ]]; then
+        emit_json "fail" "false" "nvidia-smi not found"
+    else
+        fail "nvidia-smi not found — install nvidia-driver-* or run with --dev"
+    fi
+    exit 1
+fi
+
+# 2) nvidia-smi present — does it report at least one device?
+if ! nvidia-smi -L >/dev/null 2>&1; then
+    if [[ $DEV_MODE -eq 1 ]]; then
+        if [[ $JSON -eq 1 ]]; then
+            emit_json "warn" "false" "nvidia-smi present but no GPU listed"
+        else
+            warn "nvidia-smi present but reports no GPU — CPU-only dev mode (NOT field-test ready)"
+        fi
+        exit 0
+    fi
+    if [[ $JSON -eq 1 ]]; then
+        emit_json "fail" "false" "nvidia-smi present but reports no GPU"
+    else
+        fail "nvidia-smi present but reports no GPU"
+    fi
+    exit 1
+fi
+
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+if [[ $JSON -eq 1 ]]; then
+    emit_json "ok" "true" "" "$GPU_NAME" "$DRIVER"
+else
+    log "GPU OK: ${GPU_NAME:-unknown} (driver ${DRIVER:-unknown}) — field-test ready"
+fi
+exit 0

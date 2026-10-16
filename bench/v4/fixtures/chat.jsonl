@@ -1,0 +1,5 @@
+{"message_index": 0, "user_message": "hello, we need to deploy the api gateway", "assistant_message": "what region?"}
+{"message_index": 1, "user_message": "us-east-1 to start", "assistant_message": "I'll prepare a rollout plan."}
+{"message_index": 2, "user_message": "actually let's switch topics — pricing model", "assistant_message": "ok, what about pricing?", "topic_branch": {"new": "Pricing"}}
+{"message_index": 3, "user_message": "tiered, per-seat", "assistant_message": "tiered per-seat is fine for the SMB segment."}
+{"message_index": 4, "user_message": "back to deploy: which DB cluster?", "assistant_message": "back on deploy — DB cluster cluster-7?"}

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maludb-realtimed"
+version = "0.1.0"
+description = "MaluDB realtime gateway — SSE stream over malu$event with V3-AUTH-01 token auth and replay-from-cursor."
+readme = "README.md"
+license = { text = "PostgreSQL" }
+requires-python = ">=3.10"
+authors = [{ name = "Edward Honour", email = "ed@maludb.org" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: PostgreSQL License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+
+dependencies = ["psycopg[binary]>=3.1"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+maludb-realtimed = "maludb_realtimed.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maludb_realtimed"]

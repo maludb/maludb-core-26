@@ -1,0 +1,823 @@
+\set ECHO all
+\pset format unaligned
+SET client_min_messages = WARNING;
+CREATE EXTENSION IF NOT EXISTS maludb_core CASCADE;
+DO $body$
+DECLARE
+    v_schema name;
+    v_tables text[] := ARRAY[
+        'malu$model_response',
+        'malu$model_request',
+        'malu$prompt_render',
+        'malu$session_context',
+        'malu$session',
+        'malu$model_alias',
+        'malu$prompt_template',
+        'malu$workflow_step',
+        'malu$workflow_candidate',
+        'malu$workflow_cluster_member',
+        'malu$workflow_cluster',
+        'malu$workflow_trace',
+        'malu$skill_execution_step',
+        'malu$skill_execution_record',
+        'malu$skill_transition',
+        'malu$skill_state',
+        'malu$skill_package',
+        'malu$episode_object',
+        'malu$mc2db_invocation',
+        'malu$mc2db_resource',
+        'malu$mc2db_prompt',
+        'malu$mc2db_tool',
+        'malu$mc2db_server',
+        'malu$document_tag',
+        'malu$ingest_extraction',
+        'malu$document',
+        'malu$raw_ingest',
+        'malu$active_memory_pool_access',
+        'malu$active_memory_pool_tag',
+        'malu$active_memory_pool_member',
+        'malu$pool_presence_event',
+        'malu$pool_presence',
+        'malu$active_memory_pool',
+        'malu$vector_compartment',
+        'malu$vector_subject',
+        'malu$vector_verb',
+        'malu$svpor_subject_relationship_edge',
+        'malu$svpor_subject',
+        'malu$svpor_verb',
+        'malu$fact',
+        'malu$claim',
+        'malu$memory_detail_object',
+        'malu$memory',
+        'malu$source_package'
+    ];
+    v_table text;
+BEGIN
+    FOREACH v_schema IN ARRAY ARRAY['sme_a'::name, 'sme_b'::name, 'sme_block'::name] LOOP
+        FOREACH v_table IN ARRAY v_tables LOOP
+            IF to_regclass('maludb_core.' || quote_ident(v_table)) IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_attribute
+                   WHERE attrelid = to_regclass('maludb_core.' || quote_ident(v_table))
+                     AND attname = 'owner_schema'
+                     AND NOT attisdropped
+               )
+            THEN
+                EXECUTE format('DELETE FROM maludb_core.%I WHERE owner_schema = $1', v_table)
+                USING v_schema;
+            END IF;
+        END LOOP;
+        IF to_regclass('maludb_core.malu$enabled_schema_object') IS NOT NULL THEN
+            DELETE FROM maludb_core.malu$enabled_schema_object WHERE schema_name = v_schema;
+        END IF;
+        IF to_regclass('maludb_core.malu$enabled_schema') IS NOT NULL THEN
+            DELETE FROM maludb_core.malu$enabled_schema WHERE schema_name = v_schema;
+        END IF;
+        EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', v_schema);
+    END LOOP;
+    IF to_regclass('maludb_core.malu$model_provider') IS NOT NULL THEN
+        DELETE FROM maludb_core.malu$model_provider WHERE provider_name = 'sme-provider';
+    END IF;
+    IF to_regclass('maludb_core.malu$account') IS NOT NULL THEN
+        DELETE FROM maludb_core.malu$account WHERE account_name = 'sme-account';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sme_user_a') THEN
+        DROP OWNED BY sme_user_a;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sme_user_b') THEN
+        DROP OWNED BY sme_user_b;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sme_block_user') THEN
+        DROP OWNED BY sme_block_user;
+    END IF;
+END;
+$body$;
+SET search_path TO maludb_core, public;
+SET client_min_messages = NOTICE;
+
+DROP SCHEMA IF EXISTS sme_a CASCADE;
+DROP SCHEMA IF EXISTS sme_b CASCADE;
+DROP SCHEMA IF EXISTS sme_block CASCADE;
+DROP ROLE IF EXISTS sme_user_a;
+DROP ROLE IF EXISTS sme_user_b;
+DROP ROLE IF EXISTS sme_block_user;
+
+CREATE ROLE sme_user_a NOLOGIN;
+CREATE ROLE sme_user_b NOLOGIN;
+CREATE ROLE sme_block_user NOLOGIN;
+GRANT maludb_memory_executor TO sme_user_a, sme_user_b;
+GRANT maludb_memory_executor TO sme_block_user;
+GRANT USAGE ON SCHEMA maludb_core TO sme_user_a, sme_user_b;
+GRANT USAGE ON SCHEMA maludb_core TO sme_block_user;
+
+CREATE SCHEMA sme_a AUTHORIZATION sme_user_a;
+CREATE SCHEMA sme_b AUTHORIZATION sme_user_b;
+CREATE SCHEMA sme_block AUTHORIZATION sme_block_user;
+
+SELECT NOT has_function_privilege(
+           'maludb_memory_admin',
+           'maludb_core._enable_memory_schema_subject_facade(name)',
+           'EXECUTE'
+       )
+   AND NOT has_function_privilege(
+           'maludb_memory_admin',
+           'maludb_core._enable_memory_schema_core_facade(name)',
+           'EXECUTE'
+       )
+   AND NOT has_function_privilege(
+           'maludb_memory_admin',
+           'maludb_core._enable_memory_schema_ingest_facade(name)',
+           'EXECUTE'
+       )
+   AND NOT has_function_privilege(
+           'maludb_memory_admin',
+           'maludb_core._enable_memory_schema_pool_facade(name)',
+           'EXECUTE'
+       )
+   AND NOT has_function_privilege(
+           'maludb_memory_admin',
+           'maludb_core._enable_memory_schema_ai_facade(name)',
+           'EXECUTE'
+       ) AS private_helpers_not_granted;
+
+SELECT count(*) AS a_pre_enable_objects
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'sme_a'
+  AND c.relname LIKE 'maludb_%';
+
+CREATE VIEW sme_block.maludb_document AS
+SELECT NULL::bigint AS document_id,
+       NULL::bigint AS source_package_id,
+       NULL::text AS title,
+       NULL::text AS source_type,
+       NULL::text AS media_type,
+       NULL::bigint AS primary_project_id,
+       NULL::text AS lifecycle_state,
+       '{}'::jsonb AS metadata_jsonb,
+       NULL::timestamptz AS created_at,
+       NULL::timestamptz AS updated_at
+WHERE false;
+ALTER VIEW sme_block.maludb_document OWNER TO sme_block_user;
+
+SET ROLE sme_block_user;
+SET search_path TO sme_block, maludb_core, public;
+SELECT object_count AS blocked_enable_object_count
+FROM maludb_core.enable_memory_schema();
+
+RESET ROLE;
+SET search_path TO maludb_core, public;
+DROP SCHEMA sme_block CASCADE;
+DROP OWNED BY sme_block_user;
+DROP ROLE sme_block_user;
+
+SET ROLE sme_user_a;
+SET search_path TO sme_a, maludb_core, public;
+
+SELECT object_count AS enable_object_count
+FROM maludb_core.enable_memory_schema();
+
+SELECT object_count AS enable_refresh_object_count
+FROM maludb_core.enable_memory_schema();
+
+SELECT bool_and(c.oid IS NOT NULL) AS enabled_facades_created
+FROM unnest(ARRAY[
+    'maludb_subject',
+    'maludb_verb',
+    'maludb_subject_verb',
+    'maludb_claim',
+    'maludb_fact',
+    'maludb_memory',
+    'maludb_source_package',
+    'maludb_document',
+    'maludb_document_tag',
+    'maludb_document_suggested_tag',
+    'maludb_subject_relationship',
+    'maludb_raw_ingest',
+    'maludb_unapplied_ingest',
+    'maludb_memory_pool',
+    'maludb_memory_pool_member',
+    'maludb_memory_pool_tag',
+    'maludb_memory_pool_access',
+    'maludb_pool_subject',
+    'maludb_pool_verb',
+    'maludb_pool_subject_verb',
+    'maludb_pool_skill',
+    'maludb_pool_document',
+    'maludb_pool_presence',
+    'maludb_prompt',
+    'maludb_prompt_render',
+    'maludb_llm_provider',
+    'maludb_llm_model',
+    'maludb_llm_request',
+    'maludb_llm_response',
+    'maludb_skill',
+    'maludb_skill_state',
+    'maludb_skill_transition',
+    'maludb_skill_execution',
+    'maludb_workflow_trace',
+    'maludb_workflow_step',
+    'maludb_workflow_candidate',
+    'maludb_mcp_server',
+    'maludb_mcp_tool',
+    'maludb_mcp_prompt',
+    'maludb_mcp_resource',
+    'maludb_mcp_invocation'
+]) AS expected(relname)
+LEFT JOIN pg_namespace n
+       ON n.nspname = 'sme_a'
+LEFT JOIN pg_class c
+       ON c.relnamespace = n.oid
+      AND c.relname = expected.relname;
+
+SELECT expected.relname AS missing_facade_after_pool_task
+FROM unnest(ARRAY[
+    'maludb_memory_pool'
+]) AS expected(relname)
+LEFT JOIN pg_namespace n
+       ON n.nspname = 'sme_a'
+LEFT JOIN pg_class c
+       ON c.relnamespace = n.oid
+      AND c.relname = expected.relname
+WHERE c.oid IS NULL
+ORDER BY expected.relname;
+
+SELECT count(*) >= 0 AS ai_facades_queryable
+FROM maludb_skill;
+
+SELECT count(*) >= 0 AS mcp_facades_queryable
+FROM maludb_mcp_invocation;
+
+SELECT count(*) = 0 AS llm_provider_secret_hidden
+FROM information_schema.columns
+WHERE table_schema = 'sme_a'
+  AND table_name = 'maludb_llm_provider'
+  AND column_name = 'secret_ref';
+
+INSERT INTO maludb_prompt(template_name, body)
+VALUES ('schema facade prompt', 'prompt body')
+RETURNING template_name;
+
+RESET ROLE;
+SET search_path TO maludb_core, public;
+
+SELECT owner_schema, template_name
+FROM maludb_core.malu$prompt_template
+WHERE template_name = 'schema facade prompt';
+
+SET ROLE sme_user_a;
+SET search_path TO sme_a, maludb_core, public;
+
+INSERT INTO maludb_mcp_server(server_name, description)
+VALUES ('schema-facade-server', 'schema facade MCP server')
+RETURNING server_name;
+
+INSERT INTO maludb_mcp_tool(
+    server_id,
+    tool_name,
+    description,
+    implementation_type
+)
+SELECT server_id,
+       'schema-facade-tool',
+       'schema facade MCP tool',
+       'sql_function'
+FROM maludb_mcp_server
+WHERE server_name = 'schema-facade-server'
+RETURNING tool_name;
+
+SELECT s.owner_schema, s.server_name, t.tool_name
+FROM maludb_core.malu$mc2db_server s
+JOIN maludb_core.malu$mc2db_tool t
+  ON t.owner_schema = s.owner_schema
+ AND t.server_id = s.server_id
+WHERE s.server_name = 'schema-facade-server';
+
+RESET ROLE;
+SET search_path TO maludb_core, public;
+
+DO $body$
+DECLARE
+    v_foreign_server_id bigint;
+    v_foreign_tool_id bigint;
+    v_foreign_skill_id bigint;
+    v_foreign_episode_id bigint;
+    v_foreign_trace_id bigint;
+    v_local_episode_id bigint;
+    v_local_trace_id bigint;
+    v_provider_id bigint;
+    v_account_id bigint;
+    v_foreign_alias_id bigint;
+    v_foreign_template_id bigint;
+    v_foreign_project_id bigint;
+    v_foreign_source_id bigint;
+    v_foreign_fact_id bigint;
+    v_foreign_memory_id bigint;
+    v_foreign_mdo_id bigint;
+BEGIN
+    INSERT INTO maludb_core.malu$model_provider(
+        provider_name,
+        provider_kind,
+        adapter_name,
+        data_sensitivity
+    )
+    VALUES ('sme-provider', 'stub', 'sme-adapter', 'internal')
+    ON CONFLICT (owner_schema, provider_name) DO UPDATE
+       SET adapter_name = EXCLUDED.adapter_name
+    RETURNING provider_id INTO v_provider_id;
+
+    INSERT INTO maludb_core.malu$account(account_name, account_kind)
+    VALUES ('sme-account', 'service')
+    ON CONFLICT (account_name) DO UPDATE
+       SET account_kind = EXCLUDED.account_kind
+    RETURNING account_id INTO v_account_id;
+
+    INSERT INTO maludb_core.malu$mc2db_server(owner_schema, server_name, description)
+    VALUES ('sme_b', 'foreign-server', 'foreign MCP server')
+    RETURNING server_id INTO v_foreign_server_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$mc2db_tool(
+            owner_schema,
+            server_id,
+            tool_name,
+            description,
+            implementation_type
+        )
+        VALUES (
+            'sme_a',
+            v_foreign_server_id,
+            'cross-owner-tool',
+            'should fail',
+            'sql_function'
+        );
+        RAISE EXCEPTION 'cross-owner MCP tool was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: MCP tool blocks cross-owner server';
+    END;
+
+    INSERT INTO maludb_core.malu$mc2db_tool(
+        owner_schema,
+        server_id,
+        tool_name,
+        description,
+        implementation_type
+    )
+    VALUES (
+        'sme_b',
+        v_foreign_server_id,
+        'foreign-tool',
+        'foreign MCP tool',
+        'sql_function'
+    )
+    RETURNING tool_id INTO v_foreign_tool_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$mc2db_invocation(
+            owner_schema,
+            tool_id,
+            tool_name,
+            implementation_type,
+            success
+        )
+        VALUES ('sme_a', v_foreign_tool_id, 'foreign-tool', 'sql_function', true);
+        RAISE EXCEPTION 'cross-owner MCP invocation was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: MCP invocation blocks cross-owner tool';
+    END;
+
+    INSERT INTO maludb_core.malu$mc2db_server(owner_schema, server_name, description)
+    VALUES ('sme_b', 'schema-facade-server', 'same server name in another schema');
+
+    INSERT INTO maludb_core.malu$prompt_template(owner_schema, template_name, body)
+    VALUES ('sme_b', 'schema facade prompt', 'same prompt name in another schema')
+    RETURNING template_id INTO v_foreign_template_id;
+
+    INSERT INTO maludb_core.malu$model_alias(
+        owner_schema,
+        alias_name,
+        provider_id,
+        model_identifier
+    )
+    VALUES ('sme_b', 'shared-alias', v_provider_id, 'sme-foreign-model')
+    RETURNING alias_id INTO v_foreign_alias_id;
+
+    INSERT INTO maludb_core.malu$model_alias(
+        owner_schema,
+        alias_name,
+        provider_id,
+        model_identifier
+    )
+    VALUES ('sme_a', 'shared-alias', v_provider_id, 'sme-local-model');
+
+    BEGIN
+        INSERT INTO maludb_core.malu$session(
+            owner_schema,
+            account_id,
+            model_alias_id,
+            prompt_template_id
+        )
+        VALUES ('sme_a', v_account_id, v_foreign_alias_id, v_foreign_template_id);
+        RAISE EXCEPTION 'cross-owner LLM session was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: LLM session blocks cross-owner alias/template';
+    END;
+
+    INSERT INTO maludb_core.malu$svpor_subject(owner_schema, canonical_name, subject_type)
+    VALUES ('sme_b', 'foreign project', 'project')
+    RETURNING subject_id INTO v_foreign_project_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$document(
+            owner_schema,
+            title,
+            source_type,
+            primary_project_id
+        )
+        VALUES (
+            'sme_a',
+            'cross-owner document project',
+            (SELECT source_type FROM maludb_core.malu$source_type ORDER BY source_type LIMIT 1),
+            v_foreign_project_id
+        );
+        RAISE EXCEPTION 'cross-owner document project was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: document blocks cross-owner project';
+    END;
+
+    INSERT INTO maludb_core.malu$source_package(
+        owner_schema,
+        source_type,
+        content_text,
+        content_hash,
+        content_size
+    )
+    VALUES (
+        'sme_b',
+        (SELECT source_type FROM maludb_core.malu$source_type ORDER BY source_type LIMIT 1),
+        'foreign source package',
+        'schema-enable-foreign-source-hash',
+        22
+    )
+    RETURNING source_package_id INTO v_foreign_source_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$claim(
+            owner_schema,
+            subject,
+            verb,
+            object_value,
+            statement_text,
+            source_package_id
+        )
+        VALUES (
+            'sme_a',
+            'schema',
+            'references',
+            'foreign_source',
+            'cross-owner source package claim',
+            v_foreign_source_id
+        );
+        RAISE EXCEPTION 'cross-owner claim source was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: claim blocks cross-owner source';
+    END;
+
+    INSERT INTO maludb_core.malu$fact(owner_schema, subject, verb, object_value, statement_text)
+    VALUES ('sme_b', 'foreign', 'superseded', 'fact', 'foreign fact')
+    RETURNING fact_id INTO v_foreign_fact_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$fact(
+            owner_schema,
+            subject,
+            verb,
+            object_value,
+            statement_text,
+            supersedes_fact_id
+        )
+        VALUES ('sme_a', 'local', 'supersedes', 'foreign fact', 'local fact', v_foreign_fact_id);
+        RAISE EXCEPTION 'cross-owner fact supersession was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: fact blocks cross-owner supersession';
+    END;
+
+    INSERT INTO maludb_core.malu$memory(owner_schema, memory_kind, title)
+    VALUES ('sme_b', 'lesson', 'foreign consolidated memory')
+    RETURNING memory_id INTO v_foreign_memory_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$memory(
+            owner_schema,
+            memory_kind,
+            title,
+            consolidated_into_memory_id
+        )
+        VALUES ('sme_a', 'lesson', 'local consolidated memory', v_foreign_memory_id);
+        RAISE EXCEPTION 'cross-owner memory consolidation was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: memory blocks cross-owner consolidation';
+    END;
+
+    INSERT INTO maludb_core.malu$memory_detail_object(
+        owner_schema,
+        memory_id,
+        detail_kind,
+        title
+    )
+    VALUES ('sme_b', v_foreign_memory_id, 'note', 'foreign memory detail')
+    RETURNING mdo_id INTO v_foreign_mdo_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$memory_detail_object(
+            owner_schema,
+            memory_id,
+            detail_kind,
+            title
+        )
+        VALUES ('sme_a', v_foreign_memory_id, 'note', 'cross-owner memory detail');
+        RAISE EXCEPTION 'cross-owner memory detail memory was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: memory detail blocks cross-owner memory';
+    END;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$memory_detail_object(
+            owner_schema,
+            parent_mdo_id,
+            detail_kind,
+            title
+        )
+        VALUES ('sme_a', v_foreign_mdo_id, 'note', 'cross-owner parent detail');
+        RAISE EXCEPTION 'cross-owner memory detail parent was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: memory detail blocks cross-owner parent';
+    END;
+
+    INSERT INTO maludb_core.malu$skill_package(owner_schema, skill_name, version)
+    VALUES ('sme_b', 'foreign-skill', '1.0.0')
+    RETURNING skill_id INTO v_foreign_skill_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$skill_state(owner_schema, skill_id, state_name, state_kind)
+        VALUES ('sme_a', v_foreign_skill_id, 'cross-owner-start', 'start');
+        RAISE EXCEPTION 'cross-owner skill state was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: skill state blocks cross-owner skill';
+    END;
+
+    INSERT INTO maludb_core.malu$episode_object(owner_schema, episode_kind, title)
+    VALUES ('sme_b', 'coding', 'foreign workflow episode')
+    RETURNING episode_id INTO v_foreign_episode_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$memory_detail_object(
+            owner_schema,
+            episode_id,
+            detail_kind,
+            title
+        )
+        VALUES ('sme_a', v_foreign_episode_id, 'note', 'cross-owner episode detail');
+        RAISE EXCEPTION 'cross-owner memory detail episode was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: memory detail blocks cross-owner episode';
+    END;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$workflow_trace(
+            owner_schema,
+            episode_id,
+            subject_class,
+            action_class,
+            outcome,
+            positive_evidence
+        )
+        VALUES ('sme_a', v_foreign_episode_id, 'schema', 'enable', 'success', true);
+        RAISE EXCEPTION 'cross-owner workflow trace was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: workflow trace blocks cross-owner episode';
+    END;
+
+    INSERT INTO maludb_core.malu$workflow_trace(
+        owner_schema,
+        episode_id,
+        subject_class,
+        action_class,
+        outcome,
+        positive_evidence
+    )
+    VALUES ('sme_b', v_foreign_episode_id, 'schema', 'enable', 'success', true)
+    RETURNING trace_id INTO v_foreign_trace_id;
+
+    INSERT INTO maludb_core.malu$episode_object(owner_schema, episode_kind, title)
+    VALUES ('sme_a', 'coding', 'local workflow episode')
+    RETURNING episode_id INTO v_local_episode_id;
+
+    INSERT INTO maludb_core.malu$workflow_trace(
+        owner_schema,
+        episode_id,
+        subject_class,
+        action_class,
+        outcome,
+        positive_evidence
+    )
+    VALUES ('sme_a', v_local_episode_id, 'schema', 'enable', 'success', true)
+    RETURNING trace_id INTO v_local_trace_id;
+
+    BEGIN
+        INSERT INTO maludb_core.malu$workflow_step(
+            owner_schema,
+            trace_id,
+            step_idx,
+            action_class
+        )
+        VALUES ('sme_a', v_foreign_trace_id, 1, 'cross-owner-step');
+        RAISE EXCEPTION 'cross-owner workflow step was not blocked';
+    EXCEPTION WHEN foreign_key_violation THEN
+        RAISE NOTICE 'OK: workflow step blocks cross-owner trace';
+    END;
+END;
+$body$;
+
+SET ROLE sme_user_a;
+SET search_path TO sme_a, maludb_core, public;
+
+INSERT INTO maludb_subject(subject_type, canonical_name, aliases)
+VALUES ('project', 'schema memory enablement', ARRAY['sme'])
+RETURNING subject_type, canonical_name;
+
+SELECT owner_schema, subject_type, canonical_name
+FROM maludb_core.malu$svpor_subject
+WHERE canonical_name = 'schema memory enablement';
+
+INSERT INTO maludb_verb(canonical_name, aliases)
+VALUES ('documents', ARRAY['doc'])
+RETURNING canonical_name;
+
+SELECT maludb_subject_verb_create(
+    'default', 'schema memory enablement', 'documents', 4, 'sme-test-4d'
+) IS NOT NULL AS subject_verb_created;
+
+SELECT namespace, subject_name, verb_name, vector_count
+FROM maludb_subject_verb
+WHERE namespace = 'default';
+
+RESET ROLE;
+SET search_path TO maludb_core, public;
+
+SELECT maludb_core.register_vector_chunk(
+    (SELECT compartment_id FROM maludb_core.malu$vector_compartment WHERE owner_schema = 'sme_a' LIMIT 1),
+    'schema local chunk',
+    maludb_core.vector_from_real_array('{1,0,0,0}'::real[])
+) IS NOT NULL AS chunk_inserted;
+
+SET ROLE sme_user_a;
+SET search_path TO sme_a, maludb_core, public;
+
+SELECT source_text, subject_name, verb_name
+FROM maludb_vector_search(
+    p_subject => 'schema memory enablement',
+    p_query_embedding => maludb_core.vector_from_real_array('{1,0,0,0}'::real[]),
+    p_limit => 5
+);
+
+INSERT INTO maludb_memory(memory_kind, title, summary)
+VALUES ('lesson', 'schema facade lesson', 'tenant-local views write owner_schema correctly')
+RETURNING memory_kind, title;
+
+SELECT owner_schema, title
+FROM maludb_core.malu$memory
+WHERE title = 'schema facade lesson';
+
+INSERT INTO maludb_memory_detail(memory_id, detail_kind, title)
+SELECT memory_id, 'note', 'visible memory detail'
+FROM maludb_memory
+WHERE title = 'schema facade lesson'
+RETURNING detail_kind, title;
+
+WITH source_package AS (
+    INSERT INTO maludb_source_package(source_type, content_text, content_hash, content_size)
+    VALUES (
+        (SELECT source_type FROM maludb_core.malu$source_type ORDER BY source_type LIMIT 1),
+        'page-index source',
+        'schema-memory-enable-page-index-hash',
+        17
+    )
+    RETURNING source_package_id
+),
+page_tree AS (
+    INSERT INTO maludb_core.malu$page_index_tree(source_package_id, parser_kind)
+    SELECT source_package_id, 'plain_text'
+    FROM source_package
+    RETURNING tree_id
+)
+INSERT INTO maludb_core.malu$memory_detail_object(mdo_kind, tree_id, node_kind, detail_kind, title)
+SELECT 'page_index_node', tree_id, 'leaf', 'page_node', 'hidden page-index node'
+FROM page_tree
+RETURNING mdo_kind, title;
+
+SELECT title
+FROM maludb_memory_detail
+ORDER BY title;
+
+RESET ROLE;
+SET ROLE sme_user_b;
+SET search_path TO sme_b, maludb_core, public;
+
+SELECT count(*) AS b_pre_enable_subject_count
+FROM maludb_core.malu$svpor_subject
+WHERE canonical_name = 'schema memory enablement';
+
+RESET ROLE;
+SET search_path TO maludb_core, public;
+
+DROP SCHEMA sme_a CASCADE;
+DROP SCHEMA sme_b CASCADE;
+
+DO $body$
+DECLARE
+    v_schema name;
+    v_tables text[] := ARRAY[
+        'malu$model_response',
+        'malu$model_request',
+        'malu$prompt_render',
+        'malu$session_context',
+        'malu$session',
+        'malu$model_alias',
+        'malu$prompt_template',
+        'malu$workflow_step',
+        'malu$workflow_candidate',
+        'malu$workflow_cluster_member',
+        'malu$workflow_cluster',
+        'malu$workflow_trace',
+        'malu$skill_execution_step',
+        'malu$skill_execution_record',
+        'malu$skill_transition',
+        'malu$skill_state',
+        'malu$skill_package',
+        'malu$episode_object',
+        'malu$mc2db_invocation',
+        'malu$mc2db_resource',
+        'malu$mc2db_prompt',
+        'malu$mc2db_tool',
+        'malu$mc2db_server',
+        'malu$document_tag',
+        'malu$ingest_extraction',
+        'malu$document',
+        'malu$raw_ingest',
+        'malu$active_memory_pool_access',
+        'malu$active_memory_pool_tag',
+        'malu$active_memory_pool_member',
+        'malu$pool_presence_event',
+        'malu$pool_presence',
+        'malu$active_memory_pool',
+        'malu$vector_compartment',
+        'malu$vector_subject',
+        'malu$vector_verb',
+        'malu$svpor_subject_relationship_edge',
+        'malu$svpor_subject',
+        'malu$svpor_verb',
+        'malu$fact',
+        'malu$claim',
+        'malu$memory_detail_object',
+        'malu$memory',
+        'malu$source_package'
+    ];
+    v_table text;
+BEGIN
+    FOREACH v_schema IN ARRAY ARRAY['sme_a'::name, 'sme_b'::name, 'sme_block'::name] LOOP
+        FOREACH v_table IN ARRAY v_tables LOOP
+            IF to_regclass('maludb_core.' || quote_ident(v_table)) IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_attribute
+                   WHERE attrelid = to_regclass('maludb_core.' || quote_ident(v_table))
+                     AND attname = 'owner_schema'
+                     AND NOT attisdropped
+               )
+            THEN
+                EXECUTE format('DELETE FROM maludb_core.%I WHERE owner_schema = $1', v_table)
+                USING v_schema;
+            END IF;
+        END LOOP;
+        IF to_regclass('maludb_core.malu$enabled_schema_object') IS NOT NULL THEN
+            DELETE FROM maludb_core.malu$enabled_schema_object WHERE schema_name = v_schema;
+        END IF;
+        IF to_regclass('maludb_core.malu$enabled_schema') IS NOT NULL THEN
+            DELETE FROM maludb_core.malu$enabled_schema WHERE schema_name = v_schema;
+        END IF;
+    END LOOP;
+    IF to_regclass('maludb_core.malu$model_provider') IS NOT NULL THEN
+        DELETE FROM maludb_core.malu$model_provider WHERE provider_name = 'sme-provider';
+    END IF;
+    IF to_regclass('maludb_core.malu$account') IS NOT NULL THEN
+        DELETE FROM maludb_core.malu$account WHERE account_name = 'sme-account';
+    END IF;
+END;
+$body$;
+
+DROP OWNED BY sme_user_a;
+DROP OWNED BY sme_user_b;
+DROP ROLE sme_user_a;
+DROP ROLE sme_user_b;

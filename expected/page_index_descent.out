@@ -1,0 +1,317 @@
+-- V4 Stage 18 V4-PAGEINDEX-03 — retrieval planner descent path.
+--
+-- Five core cases plus a concurrent-supersession isolation-style
+-- check folded into the SQL test (full isolationtester ISOLATION
+-- entry is out of scope for this commit; the simulated case here
+-- proves the descent records against the pre-supersession tree_id
+-- and the planner does not crash if the prior tree transitions
+-- mid-flight).
+--
+-- Cases:
+--   1. classify_intent admits 'structured_doc_qa' and
+--      'long_chat_recall' for the right hint shapes.
+--   2. tree_descent_retrieve walks an internal->leaf chain and
+--      records one decision_audit row with stage='tree_descent'
+--      per step.
+--   3. Every descent step writes a malu$derivation_ledger entry
+--      of kind 'retrieval_summary'.
+--   4. The envelope picks up tree_descent_used=true and a populated
+--      tree_descent_path array.
+--   5. A tree in 'pending' status is rejected (descent requires
+--      ready/superseded build_status).
+--   6. RLS: a tree owned by tenant A is invisible to tenant B —
+--      tree_descent_retrieve raises insufficient_privilege and
+--      records a stage='tree_descent', allowed=false audit row.
+--   7. Concurrent supersession: descent on a tree that is then
+--      superseded mid-flight still records against the
+--      pre-supersession tree_id.
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- fixture: a tree with two-level structure ---------------
+SELECT register_source_package(
+    p_source_type  => 'document',
+    p_content_text => 'V4-PAGEINDEX-03 descent fixture document.',
+    p_media_type   => 'text/plain'
+) AS sp_id \gset
+SELECT page_index_tree_register(:sp_id, 'pdf') AS tree_id \gset
+SELECT page_index_tree_mark_building(:tree_id);
+ page_index_tree_mark_building 
+-------------------------------
+ 
+(1 row)
+
+-- Build a hand-shaped tree:
+--   root (internal)
+--    ├─ Background (leaf, "alpha beta")
+--    ├─ Methods    (internal)
+--    │   ├─ Step 1 (leaf, "gamma delta epsilon")
+--    │   └─ Step 2 (leaf, "epsilon zeta")
+--    └─ Results    (leaf, "outcome final")
+SELECT mdo_id FROM page_index_record_node(
+    :tree_id, NULL, 'internal', 'Root', 'Top-level summary.',
+    NULL, NULL, NULL, NULL, NULL) \gset root_
+SELECT mdo_id FROM page_index_record_node(
+    :tree_id, :root_mdo_id, 'leaf', 'Background',
+    'Background discusses alpha beta concepts.',
+    NULL, NULL, NULL, NULL, NULL) \gset bg_
+SELECT mdo_id FROM page_index_record_node(
+    :tree_id, :root_mdo_id, 'internal', 'Methods',
+    'Methods chapter covering gamma delta epsilon procedures.',
+    NULL, NULL, NULL, NULL, NULL) \gset methods_
+SELECT mdo_id FROM page_index_record_node(
+    :tree_id, :methods_mdo_id, 'leaf', 'Step 1',
+    'Step 1 covers gamma delta epsilon procedure.',
+    NULL, NULL, NULL, NULL, NULL) \gset step1_
+SELECT mdo_id FROM page_index_record_node(
+    :tree_id, :methods_mdo_id, 'leaf', 'Step 2',
+    'Step 2 covers epsilon zeta procedure.',
+    NULL, NULL, NULL, NULL, NULL) \gset step2_
+SELECT mdo_id FROM page_index_record_node(
+    :tree_id, :root_mdo_id, 'leaf', 'Results',
+    'Results outcome final summary.',
+    NULL, NULL, NULL, NULL, NULL) \gset results_
+SELECT page_index_tree_mark_ready(:tree_id);
+ page_index_tree_mark_ready 
+----------------------------
+ 
+(1 row)
+
+-- ====================================================================
+-- 1. classify_intent admits the two new intents.
+-- ====================================================================
+SELECT classify_intent(ROW(
+    'find delta',
+    ARRAY['page_index_node']::text[],
+    NULL, NULL, NULL,
+    jsonb_build_object('tree_id', :tree_id))::malu$retrieval_envelope_t)
+    AS intent_doc_qa;
+   intent_doc_qa   
+-------------------
+ structured_doc_qa
+(1 row)
+
+SELECT classify_intent(ROW(
+    'recap our conversation',
+    ARRAY['chat_index_topic']::text[],
+    NULL, NULL, NULL,
+    jsonb_build_object('chat_tree_id', 99))::malu$retrieval_envelope_t)
+    AS intent_chat_recall;
+ intent_chat_recall 
+--------------------
+ long_chat_recall
+(1 row)
+
+-- ====================================================================
+-- 2-4. tree_descent_retrieve end-to-end.
+-- ====================================================================
+SELECT envelope_id, leaf_mdo_id, leaf_title, depth_reached
+FROM retrieve_with_envelope_tree(
+    p_cue_text => 'gamma delta',
+    p_tree_id  => :tree_id) \gset hit_
+-- Step 2: cue 'gamma delta' should descend Root -> Methods -> Step 1.
+SELECT :hit_leaf_mdo_id = :step1_mdo_id AS landed_on_step1;
+ landed_on_step1 
+-----------------
+ t
+(1 row)
+
+SELECT :hit_depth_reached AS depth_reached;
+ depth_reached 
+---------------
+             2
+(1 row)
+
+-- Decision audit rows for the descent (stage='tree_descent').
+SELECT stage, allowed
+FROM malu$retrieval_decision_audit d
+WHERE d.envelope_id = :hit_envelope_id
+  AND d.stage = 'tree_descent'
+ORDER BY decision_id;
+    stage     | allowed 
+--------------+---------
+ tree_descent | t
+ tree_descent | t
+ tree_descent | t
+(3 rows)
+
+-- Derivation ledger entries of kind 'retrieval_summary' for each step.
+SELECT count(*) AS retrieval_summary_ledger_rows
+FROM malu$derivation_ledger
+WHERE derived_object_type = 'retrieval_summary'
+  AND (inputs_jsonb ->> 'envelope_id')::bigint = :hit_envelope_id;
+ retrieval_summary_ledger_rows 
+-------------------------------
+                             2
+(1 row)
+
+-- Envelope captured the trail.
+SELECT tree_descent_used,
+       jsonb_array_length(tree_descent_path) AS path_steps,
+       tree_descent_authz_rejections
+FROM malu$retrieval_envelope
+WHERE envelope_id = :hit_envelope_id;
+ tree_descent_used | path_steps | tree_descent_authz_rejections 
+-------------------+------------+-------------------------------
+ t                 |          3 |                             0
+(1 row)
+
+-- ====================================================================
+-- 5. Tree in 'pending' status — descent rejects.
+-- ====================================================================
+SELECT page_index_tree_register(:sp_id, 'pdf') AS pending_tree \gset
+DO $body$
+DECLARE v_env bigint;
+BEGIN
+    INSERT INTO maludb_core.malu$retrieval_envelope
+        (account_id, cue_text, hints, partitions, temporal_mode,
+         object_types, started_at)
+    VALUES (NULL, 'x', '{}'::jsonb, ARRAY[]::text[], 'current_valid',
+            ARRAY['page_index_node']::text[], now())
+    RETURNING envelope_id INTO v_env;
+
+    BEGIN
+        PERFORM tree_descent_retrieve(
+            v_env,
+            (SELECT tree_id FROM maludb_core.malu$page_index_tree
+             WHERE build_status = 'pending'
+             ORDER BY tree_id DESC LIMIT 1));
+        RAISE EXCEPTION 'descent on pending tree should have been rejected';
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        RAISE NOTICE 'OK: descent rejects pending tree';
+    END;
+END $body$;
+NOTICE:  OK: descent rejects pending tree
+-- ====================================================================
+-- 6. RLS: cross-tenant descent is rejected.
+-- ====================================================================
+DROP ROLE   IF EXISTS pi3_user_a;
+NOTICE:  role "pi3_user_a" does not exist, skipping
+DROP ROLE   IF EXISTS pi3_user_b;
+NOTICE:  role "pi3_user_b" does not exist, skipping
+DROP SCHEMA IF EXISTS pi3_a CASCADE;
+NOTICE:  schema "pi3_a" does not exist, skipping
+DROP SCHEMA IF EXISTS pi3_b CASCADE;
+NOTICE:  schema "pi3_b" does not exist, skipping
+CREATE ROLE pi3_user_a NOLOGIN;
+CREATE ROLE pi3_user_b NOLOGIN;
+GRANT maludb_memory_executor TO pi3_user_a, pi3_user_b;
+GRANT USAGE ON SCHEMA maludb_core TO pi3_user_a, pi3_user_b;
+CREATE SCHEMA pi3_a AUTHORIZATION pi3_user_a;
+CREATE SCHEMA pi3_b AUTHORIZATION pi3_user_b;
+SET ROLE pi3_user_a;
+SET search_path TO pi3_a, maludb_core, public;
+SELECT register_source_package(
+    p_source_type  => 'document',
+    p_content_text => 'tenant A descent fixture.',
+    p_media_type   => 'text/plain'
+) AS sp_priv \gset
+SELECT page_index_tree_register(:sp_priv, 'pdf') AS priv_tree \gset
+SELECT page_index_tree_mark_building(:priv_tree);
+ page_index_tree_mark_building 
+-------------------------------
+ 
+(1 row)
+
+SELECT mdo_id FROM page_index_record_node(
+    :priv_tree, NULL, 'leaf', 'Solo', 'Tenant A leaf.',
+    NULL, NULL, NULL, NULL, NULL) \gset
+SELECT page_index_tree_mark_ready(:priv_tree);
+ page_index_tree_mark_ready 
+----------------------------
+ 
+(1 row)
+
+SET ROLE pi3_user_b;
+SET search_path TO pi3_b, maludb_core, public;
+DO $body$
+DECLARE v_env bigint;
+BEGIN
+    INSERT INTO maludb_core.malu$retrieval_envelope
+        (account_id, cue_text, hints, partitions, temporal_mode,
+         object_types, started_at)
+    VALUES (NULL, 'x', '{}'::jsonb, ARRAY[]::text[], 'current_valid',
+            ARRAY['page_index_node']::text[], now())
+    RETURNING envelope_id INTO v_env;
+    BEGIN
+        PERFORM tree_descent_retrieve(
+            v_env,
+            (SELECT tree_id FROM maludb_core.malu$page_index_tree
+             WHERE owner_schema = 'pi3_a' LIMIT 1));
+        RAISE EXCEPTION 'cross-tenant descent should have been rejected';
+    EXCEPTION WHEN insufficient_privilege OR no_data_found THEN
+        RAISE NOTICE 'OK: cross-tenant descent rejected';
+    END;
+END $body$;
+NOTICE:  OK: cross-tenant descent rejected
+RESET ROLE;
+RESET search_path;
+SET search_path TO maludb_core, public;
+-- ====================================================================
+-- 7. Concurrent supersession: simulate by superseding the fixture tree
+--    AFTER a descent has already recorded a path. The supersession
+--    does not retroactively rewrite the prior envelope's tree_descent_path
+--    or its decision_audit rows — the trail stays anchored to the
+--    pre-supersession tree_id.
+-- ====================================================================
+SELECT page_index_tree_register(:sp_id, 'pdf') AS new_tree \gset
+SELECT page_index_tree_mark_building(:new_tree);
+ page_index_tree_mark_building 
+-------------------------------
+ 
+(1 row)
+
+SELECT page_index_tree_mark_ready(:new_tree);
+ page_index_tree_mark_ready 
+----------------------------
+ 
+(1 row)
+
+SELECT page_index_tree_supersede(:tree_id, :new_tree);
+ page_index_tree_supersede 
+---------------------------
+                        12
+(1 row)
+
+-- The descent envelope from case 2 still records the original tree_id
+-- in its decision_audit rows.
+SELECT object_type, object_id = :tree_id AS points_at_pre_supersession
+FROM malu$retrieval_decision_audit
+WHERE envelope_id = :hit_envelope_id
+  AND stage = 'tree_descent'
+  AND object_type = 'page_index_tree';
+   object_type   | points_at_pre_supersession 
+-----------------+----------------------------
+ page_index_tree | t
+(1 row)
+
+-- A new descent against the superseded prior tree fails at planning.
+DO $body$
+DECLARE v_env bigint;
+BEGIN
+    INSERT INTO maludb_core.malu$retrieval_envelope
+        (account_id, cue_text, hints, partitions, temporal_mode,
+         object_types, started_at)
+    VALUES (NULL, 'gamma', '{}'::jsonb, ARRAY[]::text[], 'current_valid',
+            ARRAY['page_index_node']::text[], now())
+    RETURNING envelope_id INTO v_env;
+    -- Superseded trees are still descendable per the V4 design — they
+    -- return the historical state. Verify that path succeeds.
+    PERFORM tree_descent_retrieve(
+        v_env,
+        (SELECT tree_id FROM maludb_core.malu$page_index_tree
+         WHERE build_status = 'superseded' ORDER BY tree_id LIMIT 1));
+    RAISE NOTICE 'OK: descent on superseded tree succeeds (historical recall)';
+END $body$;
+NOTICE:  OK: descent on superseded tree succeeds (historical recall)
+-- ---------- cleanup --------------------------------------------------
+DELETE FROM malu$page_index_tree
+ WHERE owner_schema IN ('pi3_a','pi3_b');
+DELETE FROM malu$source_package
+ WHERE owner_schema IN ('pi3_a','pi3_b');
+DROP SCHEMA pi3_a CASCADE;
+DROP SCHEMA pi3_b CASCADE;
+DROP OWNED BY pi3_user_a;
+DROP OWNED BY pi3_user_b;
+DROP ROLE   pi3_user_a;
+DROP ROLE   pi3_user_b;

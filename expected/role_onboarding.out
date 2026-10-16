@@ -1,0 +1,26 @@
+\set ECHO none
+onboarding_roles_exist
+t
+(1 row)
+helper_granted_role
+maludb_read
+(1 row)
+owner_has_executor|reader_has_reader|writer_has_executor|admin_has_admin
+t|t|t|t
+(1 row)
+schema_enabled
+t
+(1 row)
+reader_project
+onboarding project
+(1 row)
+ERROR:  permission denied for view maludb_project
+helper_reader_project
+onboarding project
+(1 row)
+writer_project_count
+2
+(1 row)
+short_writer_project_count
+3
+(1 row)

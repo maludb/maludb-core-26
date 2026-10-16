@@ -1,0 +1,71 @@
+SET search_path TO maludb_core, public;
+SELECT submit_request('alias-stub', 'hello world',
+                      NULL, NULL, '{"max_tokens":16}'::jsonb, 5000) AS request_id \gset
+SELECT request_status(:request_id) AS pending_status;
+ pending_status 
+----------------
+ pending
+(1 row)
+
+SELECT prompt_hash FROM malu$model_request WHERE request_id = :request_id;
+                           prompt_hash                            
+------------------------------------------------------------------
+ b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+(1 row)
+
+SELECT mc_stub_process(:request_id) AS response_id;
+ response_id 
+-------------
+           1
+(1 row)
+
+SELECT request_status(:request_id) AS final_status;
+ final_status 
+--------------
+ succeeded
+(1 row)
+
+SELECT status, output_text, output_hash, adapter_name
+FROM get_response(:request_id);
+  status   |                                    output_text                                     |                           output_hash                            | adapter_name 
+-----------+------------------------------------------------------------------------------------+------------------------------------------------------------------+--------------
+ succeeded | MALUDB_STUB_REPLY:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9 | b9bc15b953eacfbd0a26dc36185fc3042bae9965206fe6c9cad540bb3a87886f | stub
+(1 row)
+
+SELECT mc_stub_process(:request_id) AS idempotent_response_id;
+ idempotent_response_id 
+------------------------
+                      1
+(1 row)
+
+SELECT count(*) AS responses_for_request FROM malu$model_response WHERE request_id = :request_id;
+ responses_for_request 
+-----------------------
+                     1
+(1 row)
+
+SELECT submit_request('alias-stub', 'cancel-me') AS rid \gset
+SELECT cancel_request(:rid) AS after_cancel;
+ after_cancel 
+--------------
+ cancelled
+(1 row)
+
+SELECT mc_stub_process(:rid) AS cancelled_response_id;
+ cancelled_response_id 
+-----------------------
+                     2
+(1 row)
+
+SELECT status, error_class, adapter_name FROM get_response(:rid);
+  status   | error_class | adapter_name 
+-----------+-------------+--------------
+ cancelled | cancelled   | stub
+(1 row)
+
+SELECT submit_request('no-such-alias', 'x');
+ERROR:  unknown or disabled alias: no-such-alias
+CONTEXT:  PL/pgSQL function submit_request(text,text,text,bigint,jsonb,integer) line 13 at RAISE
+SELECT cancel_request(999999);
+ERROR:  unknown request: 999999
+CONTEXT:  PL/pgSQL function cancel_request(bigint) line 12 at RAISE

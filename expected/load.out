@@ -1,0 +1,24 @@
+\pset format unaligned
+CREATE EXTENSION maludb_core CASCADE;
+NOTICE:  installing required extension "vector"
+NOTICE:  installing required extension "btree_gist"
+NOTICE:  installing required extension "pg_trgm"
+NOTICE:  installing required extension "pgcrypto"
+SELECT extname, extversion FROM pg_extension WHERE extname = 'maludb_core';
+extname|extversion
+maludb_core|0.106.0
+(1 row)
+SELECT maludb_core.maludb_core_version();
+maludb_core_version
+0.106.0
+(1 row)
+SELECT maludb_core.maludb_core_release();
+maludb_core_release
+R1.0 Stage 1 substrate
+(1 row)
+SELECT count(*) > 0 AS has_maludb_core_schema
+FROM pg_namespace
+WHERE nspname = 'maludb_core';
+has_maludb_core_schema
+t
+(1 row)

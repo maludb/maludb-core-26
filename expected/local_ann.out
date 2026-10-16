@@ -1,0 +1,241 @@
+-- R1.1-16: Local ANN per compartment.
+--
+-- Exercises:
+--   * ann_build creates malu$ann_index row + flips search_mode
+--   * ann_status reports counts
+--   * exact_vector_search_sql with search_mode='local_ann' uses graph
+--   * register_vector_chunk after build → delta buffer; visible at search
+--   * tombstone_vector_chunk filters chunks out of search
+--   * ann_rebuild drains delta + clears tombstones
+--   * search results match exact-search ranking for small N (no recall loss)
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- fixture: a 4-dim compartment with 8 chunks --------------
+SELECT register_vector_compartment(
+    p_namespace       => 'r116',
+    p_subject_name    => 'docs',
+    p_verb_name       => 'ranked',
+    p_embedding_dim   => 4,
+    p_embedding_model => 'r116-test-4d',
+    p_distance_metric => 'cosine'
+) AS compartment_id \gset
+DO $$
+DECLARE
+    v_inputs constant text[] := ARRAY[
+        '{0.95,0.10,0.05,0.05}',
+        '{0.85,0.15,0.20,0.10}',
+        '{0.10,0.95,0.05,0.05}',
+        '{0.10,0.10,0.90,0.10}',
+        '{0.05,0.05,0.10,0.95}',
+        '{0.70,0.30,0.10,0.05}',
+        '{0.60,0.60,0.05,0.10}',
+        '{0.30,0.40,0.50,0.45}'
+    ];
+    v_labels constant text[] := ARRAY[
+        'A_x','B_x_alt','C_y','D_z','E_w','F_x_slight','G_xy','H_random'];
+    i int;
+BEGIN
+    FOR i IN 1..array_length(v_inputs, 1) LOOP
+        PERFORM register_vector_chunk(
+            (SELECT compartment_id FROM malu$vector_compartment WHERE namespace='r116' LIMIT 1),
+            v_labels[i],
+            vector_from_real_array(v_inputs[i]::real[]));
+    END LOOP;
+END $$;
+-- ---------- ann_build ----------------------------------------------
+SELECT ann_build(:compartment_id, p_m => 8, p_ef_construction => 16,
+                 p_ef_search => 16) AS built_count;
+ built_count 
+-------------
+           8
+(1 row)
+
+SELECT search_mode, ann_index_status
+FROM malu$vector_compartment WHERE compartment_id = :compartment_id;
+ search_mode | ann_index_status 
+-------------+------------------
+ local_ann   | ready
+(1 row)
+
+SELECT algorithm, distance_metric, m, ef_construction, ef_search_default,
+       embedding_dim, vector_count_at_build, status
+FROM malu$ann_index WHERE compartment_id = :compartment_id;
+ algorithm | distance_metric | m | ef_construction | ef_search_default | embedding_dim | vector_count_at_build | status 
+-----------+-----------------+---+-----------------+-------------------+---------------+-----------------------+--------
+ nsw       | cosine          | 8 |              16 |                16 |             4 |                     8 | ready
+(1 row)
+
+-- ann_status snapshot
+SELECT m, embedding_dim, vector_count_at_build, delta_count, tombstone_count, status
+FROM ann_status(:compartment_id);
+ m | embedding_dim | vector_count_at_build | delta_count | tombstone_count | status 
+---+---------------+-----------------------+-------------+-----------------+--------
+ 8 |             4 |                     8 |           0 |               0 | ready
+(1 row)
+
+-- ---------- search via the dispatcher (search_mode='local_ann') ----
+SELECT source_text, rank_no
+FROM exact_vector_search_sql(
+    :compartment_id,
+    '[0.99, 0.10, 0.05, 0.05]'::malu_vector,
+    3, 'cosine')
+ORDER BY rank_no;
+ source_text | rank_no 
+-------------+---------
+ A_x         |       1
+ B_x_alt     |       2
+ F_x_slight  |       3
+(3 rows)
+
+-- ---------- exact ranking parity (for this N, the ANN should recover
+-- the same top-3 as exact)
+UPDATE malu$vector_compartment SET search_mode='exact'
+WHERE compartment_id = :compartment_id;
+CREATE TEMP TABLE _ann_exact AS
+SELECT array_agg(source_text ORDER BY rank_no) AS labels
+FROM exact_vector_search_sql(
+    :compartment_id,
+    '[0.99, 0.10, 0.05, 0.05]'::malu_vector,
+    3, 'cosine');
+UPDATE malu$vector_compartment SET search_mode='local_ann'
+WHERE compartment_id = :compartment_id;
+CREATE TEMP TABLE _ann_ann AS
+SELECT array_agg(source_text ORDER BY rank_no) AS labels
+FROM exact_vector_search_sql(
+    :compartment_id,
+    '[0.99, 0.10, 0.05, 0.05]'::malu_vector,
+    3, 'cosine');
+SELECT (e.labels = a.labels) AS top3_matches
+FROM _ann_exact e, _ann_ann a;
+ top3_matches 
+--------------
+ t
+(1 row)
+
+-- ---------- delta buffer: new chunk after build → searchable -------
+SELECT register_vector_chunk(
+    :compartment_id, 'I_inserted_after_build',
+    vector_from_real_array('{0.92,0.12,0.08,0.10}'::real[])) AS new_chunk \gset
+SELECT count(*) AS delta_after_insert
+FROM malu$ann_delta WHERE compartment_id = :compartment_id;
+ delta_after_insert 
+--------------------
+                  1
+(1 row)
+
+SELECT ann_index_status FROM malu$vector_compartment WHERE compartment_id = :compartment_id;
+ ann_index_status 
+------------------
+ stale
+(1 row)
+
+-- The new I_inserted_after_build is the closest match to a {0.92,...}
+-- query → should appear in the merged top-K.
+SELECT source_text, rank_no
+FROM exact_vector_search_sql(
+    :compartment_id,
+    '[0.92, 0.12, 0.08, 0.10]'::malu_vector,
+    3, 'cosine')
+ORDER BY rank_no;
+      source_text       | rank_no 
+------------------------+---------
+ I_inserted_after_build |       1
+ A_x                    |       2
+ B_x_alt                |       3
+(3 rows)
+
+-- ---------- tombstone: drop A_x from results -----------------------
+SELECT tombstone_vector_chunk(c.chunk_id) IS NULL AS tombstoned
+FROM malu$vector_chunk c
+WHERE c.compartment_id = :compartment_id AND c.source_text = 'A_x';
+ tombstoned 
+------------
+ f
+(1 row)
+
+SELECT count(*) AS tombstone_count FROM malu$vector_tombstone;
+ tombstone_count 
+-----------------
+               1
+(1 row)
+
+-- A_x should no longer appear in search results
+SELECT source_text, rank_no
+FROM exact_vector_search_sql(
+    :compartment_id,
+    '[0.99, 0.10, 0.05, 0.05]'::malu_vector,
+    3, 'cosine')
+ORDER BY rank_no;
+      source_text       | rank_no 
+------------------------+---------
+ I_inserted_after_build |       1
+ B_x_alt                |       2
+ F_x_slight             |       3
+(3 rows)
+
+-- ---------- ann_rebuild drains delta + clears tombstones -----------
+SELECT ann_rebuild(:compartment_id) AS rebuilt_count;
+ rebuilt_count 
+---------------
+             8
+(1 row)
+
+SELECT delta_count, tombstone_count
+FROM ann_status(:compartment_id);
+ delta_count | tombstone_count 
+-------------+-----------------
+           0 |               0
+(1 row)
+
+-- After rebuild, the new I_inserted_after_build is in the graph proper.
+-- A_x is gone (we dropped its tombstone but the row is still in the
+-- chunk table — actually the rebuild rebuilt WITHOUT the tombstoned
+-- chunk, but since we cleared the tombstone, it's back in. Let's
+-- re-tombstone and re-rebuild to verify the rebuild drops it for good.
+SELECT tombstone_vector_chunk(c.chunk_id) IS NULL
+FROM malu$vector_chunk c
+WHERE c.compartment_id = :compartment_id AND c.source_text = 'A_x';
+ ?column? 
+----------
+ f
+(1 row)
+
+SELECT ann_rebuild(:compartment_id) AS rebuilt_with_tombstone_count;
+ rebuilt_with_tombstone_count 
+------------------------------
+                            8
+(1 row)
+
+SELECT vector_count_at_build, delta_count, tombstone_count
+FROM ann_status(:compartment_id);
+ vector_count_at_build | delta_count | tombstone_count 
+-----------------------+-------------+-----------------
+                     8 |           0 |               0
+(1 row)
+
+-- A_x should be gone — the rebuild dropped the row that was tombstoned.
+SELECT source_text, rank_no
+FROM exact_vector_search_sql(
+    :compartment_id,
+    '[0.99, 0.10, 0.05, 0.05]'::malu_vector,
+    3, 'cosine')
+ORDER BY rank_no;
+      source_text       | rank_no 
+------------------------+---------
+ I_inserted_after_build |       1
+ B_x_alt                |       2
+ F_x_slight             |       3
+(3 rows)
+
+-- ---------- cleanup ----------------------------------------------------
+DROP TABLE _ann_exact;
+DROP TABLE _ann_ann;
+DELETE FROM malu$ann_index WHERE compartment_id = :compartment_id;
+DELETE FROM malu$vector_tombstone WHERE chunk_id IN
+    (SELECT chunk_id FROM malu$vector_chunk WHERE compartment_id = :compartment_id);
+DELETE FROM malu$ann_delta WHERE compartment_id = :compartment_id;
+DELETE FROM malu$vector_chunk WHERE compartment_id = :compartment_id;
+DELETE FROM malu$vector_compartment WHERE compartment_id = :compartment_id;
+DELETE FROM malu$vector_subject WHERE namespace='r116';
+DELETE FROM malu$vector_verb    WHERE namespace='r116';

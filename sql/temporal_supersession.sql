@@ -1,0 +1,157 @@
+-- Stage 3 S3-2 — Temporal Supersession Engine.
+--
+-- Exercises:
+--   * EXCLUDE constraint rejects overlapping active facts with same SVPOR
+--   * correct_fact closes prior + opens successor + edge + audit
+--   * retract_fact closes with no successor (kind='retraction')
+--   * close_valid_window polymorphic over fact/memory/episode/claim
+--   * reopen_valid_window admin override + audit
+--   * propagate_staleness flags downstream via relationship_edge
+--   * cannot correct an already-superseded fact
+
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+
+-- ---------- baseline fact -------------------------------------------
+SELECT register_fact(
+    p_claim_ids => ARRAY[]::bigint[],
+    p_subject   => 'pool',
+    p_verb      => 'size',
+    p_predicate => 'max',
+    p_object_value   => '20',
+    p_statement_text => 'pool max set to 20'
+) AS f1 \gset
+
+SELECT lifecycle_state, valid_time_end IS NULL AS open_end
+FROM malu$fact WHERE fact_id = :f1;
+
+-- ---------- EXCLUDE constraint rejects overlapping active SVPOR ----
+-- A second active fact with same (subject, verb, predicate) and open
+-- valid window overlaps — rejected. Wrapped in DO so the
+-- pg_regress output stays timestamp-stable.
+DO $$ BEGIN
+    PERFORM register_fact(
+        p_claim_ids => ARRAY[]::bigint[],
+        p_subject   => 'pool',
+        p_verb      => 'size',
+        p_predicate => 'max',
+        p_object_value   => '40',
+        p_statement_text => 'duplicate active fact — should be rejected');
+    RAISE EXCEPTION 'should have been rejected by EXCLUDE constraint';
+EXCEPTION WHEN exclusion_violation THEN
+    RAISE NOTICE 'OK: EXCLUDE constraint rejects overlapping active SVPOR';
+END $$;
+
+-- ---------- correct_fact -------------------------------------------
+SELECT correct_fact(
+    p_fact_id          => :f1,
+    p_new_object_value => '40',
+    p_new_statement    => 'pool max raised to 40 after incident',
+    p_reason           => 'incident postmortem'
+) AS f2 \gset
+
+-- Old fact is now superseded with closed window
+SELECT lifecycle_state, superseded_at IS NOT NULL AS sup_stamped,
+       valid_time_end IS NOT NULL AS end_closed
+FROM malu$fact WHERE fact_id = :f1;
+
+-- New fact carries the supersedes pointer + active state
+SELECT object_value, supersedes_fact_id = :f1 AS chain_back,
+       lifecycle_state, valid_time_end IS NULL AS new_open
+FROM malu$fact WHERE fact_id = :f2;
+
+-- Edge recorded
+SELECT predecessor_id = :f1 AS pred_ok,
+       successor_id   = :f2 AS succ_ok,
+       supersession_kind, reason
+FROM malu$supersession_edge
+WHERE predecessor_id = :f1 AND successor_id = :f2;
+
+-- Audit row
+SELECT count(*) AS audit_rows
+FROM malu$audit_event
+WHERE event_kind = 'correct_fact' AND target_object_id = :f1;
+
+-- ---------- cannot correct an already-superseded fact --------------
+DO $$
+DECLARE
+    v_f1 bigint;
+BEGIN
+    SELECT supersedes_fact_id INTO v_f1
+    FROM malu$fact WHERE supersedes_fact_id IS NOT NULL
+                     AND lifecycle_state = 'active'
+                   ORDER BY fact_id DESC LIMIT 1;
+    PERFORM correct_fact(
+        p_fact_id          => v_f1,
+        p_new_object_value => '60',
+        p_reason           => 'double correction');
+    RAISE EXCEPTION 'should have been rejected';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: cannot re-correct an already-superseded fact';
+END $$;
+
+-- ---------- retract_fact ------------------------------------------
+SELECT retract_fact(:f2, 'pool resized via external infra; fact no longer authoritative')
+       IS NULL AS retracted;
+
+SELECT lifecycle_state, valid_time_end IS NOT NULL AS closed
+FROM malu$fact WHERE fact_id = :f2;
+
+SELECT supersession_kind, successor_id IS NULL AS no_successor
+FROM malu$supersession_edge
+WHERE predecessor_id = :f2 AND supersession_kind = 'retraction';
+
+-- ---------- close_valid_window polymorphic -------------------------
+SELECT register_memory(p_memory_kind=>'event', p_title=>'supersession target') AS m1 \gset
+SELECT register_episode(p_episode_kind=>'release_cut', p_title=>'release-1') AS e1 \gset
+
+SELECT close_valid_window('memory', :m1, p_reason=>'consolidated') IS NULL AS mem_closed;
+SELECT close_valid_window('episode_object', :e1) IS NULL AS ep_closed;
+
+SELECT valid_time_end IS NOT NULL AS mem_valid_end_set
+FROM malu$memory WHERE memory_id = :m1;
+SELECT valid_time_end IS NOT NULL AS ep_valid_end_set
+FROM malu$episode_object WHERE episode_id = :e1;
+
+-- bad object_type
+SELECT close_valid_window('source_package', 1);
+
+-- ---------- reopen_valid_window requires reason --------------------
+SELECT reopen_valid_window('memory', :m1, '');
+
+SELECT reopen_valid_window('memory', :m1, p_reason=>'rolled back consolidation')
+       IS NULL AS reopened;
+
+SELECT valid_time_end IS NULL AS mem_valid_end_cleared,
+       lifecycle_state
+FROM malu$memory WHERE memory_id = :m1;
+
+-- ---------- propagate_staleness via relationship_edge --------------
+-- Wire an edge from the memory to the (now retracted) fact f2
+SELECT register_relationship_edge(
+    p_source_object_type => 'fact',
+    p_source_object_id   => :f2,
+    p_target_object_type => 'memory',
+    p_target_object_id   => :m1,
+    p_relationship_type  => 'supports'
+) > 0 AS edge_made;
+
+SELECT stale_after IS NULL AS mem_not_stale
+FROM malu$memory WHERE memory_id = :m1;
+
+SELECT propagate_staleness('fact', :f2, 'retraction sweep') AS downstream_flagged;
+
+SELECT stale_after IS NOT NULL AS mem_now_stale
+FROM malu$memory WHERE memory_id = :m1;
+
+-- ---------- cleanup -----------------------------------------------
+DELETE FROM malu$relationship_edge
+ WHERE source_object_id IN (:f1, :f2) OR target_object_id IN (:m1, :e1);
+DELETE FROM malu$supersession_edge
+ WHERE predecessor_id IN (:f1, :f2);
+DELETE FROM malu$audit_event
+ WHERE target_object_id IN (:f1, :f2, :m1, :e1);
+DELETE FROM malu$fact WHERE fact_id IN (:f1, :f2);
+DELETE FROM malu$memory WHERE memory_id = :m1;
+DELETE FROM malu$episode_object WHERE episode_id = :e1;

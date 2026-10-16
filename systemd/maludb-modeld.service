@@ -1,0 +1,41 @@
+[Unit]
+Description=MaluDB Model Gateway Daemon (R1.0)
+Documentation=https://github.com/maludb/maludb-core/blob/main/docs/maludb-modeld-contract.md
+After=postgresql.service network-online.target
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=maludb_modeld
+Group=maludb
+EnvironmentFile=-/etc/maludb/maludb.conf
+EnvironmentFile=-/etc/maludb/maludb-modeld.conf
+ExecStart=/usr/local/sbin/maludb_modeld
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+# llama-cli needs CUDA / GPU device access; relax PrivateDevices.
+DeviceAllow=/dev/nvidia* rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/maludb
+ReadWritePaths=/var/log/maludb
+
+[Install]
+WantedBy=multi-user.target

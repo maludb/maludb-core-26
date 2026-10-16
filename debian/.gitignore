@@ -1,0 +1,18 @@
+# Build artefacts produced by dpkg-buildpackage / dh.
+# These are NOT source — they regenerate on every build.
+
+.debhelper/
+debhelper-build-stamp
+files
+*.debhelper.log
+*.substvars
+tmp/
+
+# Per-package staging trees populated by dh_install.
+postgresql-16-maludb-core/
+postgresql-17-maludb-core/
+postgresql-18-maludb-core/
+maludb-mc2dbd/
+
+# Generated systemd unit (rewritten paths) — see debian/rules.
+maludb-mc2dbd.service

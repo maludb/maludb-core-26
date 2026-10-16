@@ -1,0 +1,271 @@
+-- Stage 3 S3-5 — Lifecycle + salience policy.
+--
+-- Exercises:
+--   * set_lifecycle_policy upsert
+--   * record_reinforcement + compute_salience with decay
+--   * legal_hold_apply / _release + is_under_legal_hold
+--   * apply_lifecycle_state polymorphic transition
+--   * legal hold blocks state transitions to {tombstoned, retired, archived}
+--   * consolidate_memories atomic chain (new + originals + edges +
+--     ledger + reinforcement + audit)
+--   * retention_candidates surfaces eligible rows
+--   * prune_object refuses legal-held; tombstones otherwise
+\set ECHO all
+SET search_path = maludb_core, public;
+SET client_min_messages = NOTICE;
+-- ---------- lifecycle policy ---------------------------------------
+SELECT set_lifecycle_policy(
+    'memory', p_decay_half_life_days=>30,
+    p_archive_after_idle_days=>180,
+    p_retain_for_days=>365
+) > 0 AS policy_inserted;
+ policy_inserted 
+-----------------
+ t
+(1 row)
+
+SELECT set_lifecycle_policy(
+    'memory', p_decay_half_life_days=>45
+) > 0 AS policy_updated;
+ policy_updated 
+----------------
+ t
+(1 row)
+
+SELECT decay_half_life_days, retain_for_days
+FROM malu$lifecycle_policy WHERE target_object_type = 'memory';
+ decay_half_life_days | retain_for_days 
+----------------------+-----------------
+                   45 |                
+(1 row)
+
+-- ---------- target memory + reinforcement --------------------------
+SELECT register_memory(p_memory_kind=>'event', p_title=>'reinforcement target') AS m1 \gset
+-- No events → salience = 0
+SELECT compute_salience('memory', :m1) AS salience_pre;
+ salience_pre 
+--------------
+            0
+(1 row)
+
+-- Drop in a handful of recent events at different weights
+SELECT record_reinforcement('memory', :m1, 'access',  1.0) > 0 AS r1;
+ r1 
+----
+ t
+(1 row)
+
+SELECT record_reinforcement('memory', :m1, 'access',  1.0) > 0 AS r2;
+ r2 
+----
+ t
+(1 row)
+
+SELECT record_reinforcement('memory', :m1, 'citation', 2.0) > 0 AS r3;
+ r3 
+----
+ t
+(1 row)
+
+SELECT record_reinforcement('memory', :m1, 'review',  1.5) > 0 AS r4;
+ r4 
+----
+ t
+(1 row)
+
+-- Salience should jump above 0 — recent events with half_life=45d
+SELECT compute_salience('memory', :m1) > 0     AS salience_positive,
+       compute_salience('memory', :m1) <= 1.0  AS salience_bounded;
+ salience_positive | salience_bounded 
+-------------------+------------------
+ t                 | t
+(1 row)
+
+-- ---------- legal hold --------------------------------------------
+SELECT is_under_legal_hold('memory', :m1) AS no_hold_yet;
+ no_hold_yet 
+-------------
+ f
+(1 row)
+
+SELECT legal_hold_apply('memory', :m1, 'litigation 2026-Q2') AS hold_id \gset
+SELECT is_under_legal_hold('memory', :m1) AS now_on_hold;
+ now_on_hold 
+-------------
+ t
+(1 row)
+
+-- Legal hold blocks tombstone / retire / archive
+DO $$
+DECLARE
+    v_id bigint;
+BEGIN
+    SELECT memory_id INTO v_id FROM malu$memory
+     WHERE title = 'reinforcement target' LIMIT 1;
+    PERFORM apply_lifecycle_state('memory', v_id, 'tombstoned', 'attempt');
+    RAISE EXCEPTION 'should have been blocked by legal hold';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: legal hold blocks tombstone transition';
+END $$;
+NOTICE:  OK: legal hold blocks tombstone transition
+-- Release the hold
+SELECT legal_hold_release(:hold_id, 'matter closed') IS NULL AS released;
+ released 
+----------
+ f
+(1 row)
+
+SELECT is_under_legal_hold('memory', :m1) AS hold_cleared;
+ hold_cleared 
+--------------
+ f
+(1 row)
+
+-- Now transitions succeed
+SELECT apply_lifecycle_state('memory', :m1, 'archived', 'idle')
+       IS NULL AS archived;
+ archived 
+----------
+ f
+(1 row)
+
+SELECT lifecycle_state FROM malu$memory WHERE memory_id = :m1;
+ lifecycle_state 
+-----------------
+ archived
+(1 row)
+
+-- ---------- consolidate_memories ----------------------------------
+SELECT register_memory(p_memory_kind=>'event', p_title=>'src A') AS a1 \gset
+SELECT register_memory(p_memory_kind=>'event', p_title=>'src B') AS a2 \gset
+SELECT register_memory(p_memory_kind=>'event', p_title=>'src C') AS a3 \gset
+SELECT consolidate_memories(
+    p_source_memory_ids => ARRAY[:a1, :a2, :a3]::bigint[],
+    p_consolidated_kind => 'consolidated_event',
+    p_title             => 'A+B+C consolidated',
+    p_summary           => 'Three related events merged into one record',
+    p_reason            => 'narrative cleanup'
+) AS consolidated_id \gset
+-- Each source is now consolidated
+SELECT count(*) AS consolidated_count
+FROM malu$memory
+WHERE memory_id IN (:a1, :a2, :a3)
+  AND lifecycle_state           = 'consolidated'
+  AND consolidated_into_memory_id = :consolidated_id;
+ consolidated_count 
+--------------------
+                  3
+(1 row)
+
+-- Supersession edges recorded
+SELECT count(*) AS consolidation_edges
+FROM malu$supersession_edge
+WHERE successor_id = :consolidated_id
+  AND supersession_kind = 'consolidation';
+ consolidation_edges 
+---------------------
+                   3
+(1 row)
+
+-- Derivation ledger entry written
+SELECT count(*) AS ledger_rows,
+       (inputs_jsonb ? 'source_memory_ids') AS inputs_captured
+FROM malu$derivation_ledger
+WHERE derived_object_type = 'memory'
+  AND derived_object_id   = :consolidated_id
+GROUP BY inputs_captured;
+ ledger_rows | inputs_captured 
+-------------+-----------------
+           1 | t
+(1 row)
+
+-- Reinforcement events recorded on sources (kind='consolidation')
+SELECT count(*) AS reinforcement_rows
+FROM malu$reinforcement_event
+WHERE target_object_type = 'memory'
+  AND target_object_id   = ANY(ARRAY[:a1, :a2, :a3]::bigint[])
+  AND event_kind         = 'consolidation';
+ reinforcement_rows 
+--------------------
+                  3
+(1 row)
+
+-- ---------- consolidate refuses inactive source -------------------
+SELECT consolidate_memories(
+    p_source_memory_ids => ARRAY[:a1]::bigint[],  -- already consolidated
+    p_consolidated_kind => 'x',
+    p_title             => 'should fail',
+    p_summary           => 'one source is non-active'
+);
+ERROR:  consolidate_memories: one or more source memories missing or not active
+CONTEXT:  PL/pgSQL function consolidate_memories(bigint[],text,text,text,jsonb,text) line 17 at RAISE
+-- ---------- retention_candidates ----------------------------------
+-- Set a tight retain_for so consolidated sources show up immediately.
+SELECT set_lifecycle_policy('memory', p_retain_for_days => 1) > 0 AS tightened;
+ tightened 
+-----------
+ t
+(1 row)
+
+-- Backdate the updated_at of one consolidated source so it qualifies.
+UPDATE malu$memory SET updated_at = now() - interval '7 days'
+ WHERE memory_id = :a1;
+SELECT count(*) AS candidate_count
+FROM retention_candidates('memory', now())
+WHERE object_id = :a1;
+ candidate_count 
+-----------------
+               1
+(1 row)
+
+-- ---------- prune_object refuses legal-held -----------------------
+SELECT legal_hold_apply('memory', :a1, 'protected during retention sweep') > 0 AS held_again;
+ held_again 
+------------
+ t
+(1 row)
+
+DO $$ BEGIN
+    PERFORM prune_object('memory', (SELECT memory_id FROM malu$memory
+                                     WHERE title = 'src A' LIMIT 1),
+                         'retention sweep');
+    RAISE EXCEPTION 'prune should have been blocked';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    RAISE NOTICE 'OK: prune_object refuses legal-held row';
+END $$;
+NOTICE:  OK: prune_object refuses legal-held row
+-- Release + prune
+SELECT legal_hold_release(
+    (SELECT hold_id FROM malu$legal_hold
+      WHERE target_object_id = :a1 AND released_at IS NULL LIMIT 1),
+    'retention sweep authorized') IS NULL AS released_for_prune;
+ released_for_prune 
+--------------------
+ f
+(1 row)
+
+SELECT prune_object('memory', :a1, 'retention sweep authorized') IS NULL AS pruned;
+ pruned 
+--------
+ f
+(1 row)
+
+SELECT lifecycle_state FROM malu$memory WHERE memory_id = :a1;
+ lifecycle_state 
+-----------------
+ tombstoned
+(1 row)
+
+-- ---------- cleanup ------------------------------------------------
+DELETE FROM malu$audit_event WHERE target_object_id IN
+    (:m1, :a1, :a2, :a3, :consolidated_id);
+DELETE FROM malu$reinforcement_event WHERE target_object_id IN
+    (:m1, :a1, :a2, :a3);
+DELETE FROM malu$legal_hold WHERE target_object_id IN (:m1, :a1);
+DELETE FROM malu$supersession_edge WHERE successor_id = :consolidated_id
+    OR predecessor_id IN (:a1, :a2, :a3);
+DELETE FROM malu$derivation_ledger WHERE derived_object_id = :consolidated_id;
+UPDATE malu$memory SET consolidated_into_memory_id = NULL WHERE memory_id IN
+    (:a1, :a2, :a3);
+DELETE FROM malu$memory WHERE memory_id IN
+    (:m1, :a1, :a2, :a3, :consolidated_id);
