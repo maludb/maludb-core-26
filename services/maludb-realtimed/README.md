@@ -37,7 +37,7 @@ advances the cursor; the client controls how often it acks.
 ## Smoke test
 
 ```bash
-make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 cd services/maludb-realtimed
 PYTHONPATH=src python3 -m pytest tests/
 ```

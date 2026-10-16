@@ -65,7 +65,7 @@ the rest of the project uses, so audit (`malu$audit_event`,
 ## Smoke test
 
 ```bash
-make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config   # populates contrib_regression
+make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config   # populates contrib_regression
 cd cli/maludb
 PYTHONPATH=src python3 -m pytest tests/
 ```

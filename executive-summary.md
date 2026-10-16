@@ -8,8 +8,8 @@ MaluDB is a **memory database management system**: a platform for long-term
 institutional memory, human–AI knowledge sharing, and contextual recall, in
 which memories are first-class, governed data objects rather than rows in an
 application database or chunks in a vector store. It ships as a single
-PostgreSQL 17 extension (`maludb_core`) plus a small set of companion
-services, packaged for Ubuntu 24.04 LTS, with a CLI and SDKs for C, Python,
+PostgreSQL 18 extension (`maludb_core`) plus a small set of companion
+services, packaged for Ubuntu 26.04 LTS, with a CLI and SDKs for C, Python,
 Node.js, and PHP.
 
 The defining commitment, stated in our design notes, is that **MaluDB is a
@@ -145,8 +145,8 @@ row-level security; tenant facades are created per schema by one call.
 
 Stages 1–7 (memory core), 8–15 (V3 platform: identity, REST/CLI/SDKs,
 queue/cron, archive, realtime, observability), and 16+ (V4
-PageIndex/ChatIndex) are shipped; the test suite stands at 89 `pg_regress`
-targets on PostgreSQL 17, with fresh-install ≡ upgrade-chain equivalence
+PageIndex/ChatIndex) are shipped; the test suite stands at 104 `pg_regress`
+targets on PostgreSQL 18, with fresh-install ≡ upgrade-chain equivalence
 verified on every release. Next (0.96.0+): the `maludb-embedd` worker daemon
 that puts production vectors through the semantic spine, a single retrieval
 front door (`maludb_memory_query`) that packages the routing ladder above,

@@ -22,7 +22,7 @@ the conceptual brief lives in
 PDF parsing has a long tail of corner cases (embedded outlines vs.
 heading detection, scanned PDFs, vendor-specific font encodings).
 MaluDB ships `pypdf` as the default because it is BSD-3-Clause and
-packaged in Ubuntu 24.04 as `python3-pypdf`. Operators who already
+packaged in Ubuntu 26.04 as `python3-pypdf`. Operators who already
 accept AGPL terms or hold a commercial license can plug in PyMuPDF,
 pdfminer.six, or a hosted vision parser by implementing the
 `PageIndexParser` Protocol — no code change to MaluDB itself.

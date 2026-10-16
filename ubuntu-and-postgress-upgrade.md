@@ -1,5 +1,15 @@
 # Ubuntu 26.04 + PostgreSQL 18 — Upgrade Feasibility & Level of Effort
 
+> **Status (2026-10-16): executed in [maludb/maludb-core-26](https://github.com/maludb/maludb-core-26).**
+> Converted on Ubuntu 26.04.1 + PostgreSQL 18.6 (PGDG): 104/104 `pg_regress`,
+> 28/28 mc2dbd service tests, and the restd / realtimed / logsd / pageindexd /
+> mcp-broker / CLI / Python driver suites green. PGDG `resolute-pgdg` ships
+> pgvector 0.8.7, pgaudit 18.0 and pg_partman 5.5.0; the GitHub Actions
+> `ubuntu-26.04` runner has been GA since 2026-09-17. Decision for this
+> repository: **PostgreSQL 18 only** (the 24.04 / PG 16–17 line stays in
+> maludb/maludb-core). The body below is the original pre-conversion analysis
+> and is kept unchanged as a record.
+
 Draft: 2026-05-14
 
 This document analyzes the work required to add **PostgreSQL 18** as a fully-supported runtime and **Ubuntu 26.04 LTS** as a fully-supported host OS for MaluDB. It is the operational companion to [`requirements.md`](requirements.md) §2 (Target Platform) and the V3 acceptance contract.

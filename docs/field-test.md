@@ -5,7 +5,7 @@ This is the acceptance procedure for closing R1.0 per
 21 numbered steps from the build plan and a sign-off template the
 field tester fills in.
 
-> **Scope.** A successful run on at least one Ubuntu 24.04 server —
+> **Scope.** A successful run on at least one Ubuntu 26.04 server —
 > GPU **or** CPU per the policy below — with the deterministic CI path
 > (pg_regress + mc2dbd service tests) green, is the gate for declaring
 > R1.0 field-test ready.
@@ -16,8 +16,8 @@ R1.0 has two valid hardware paths. Pick one based on what's available:
 
 | Path | Host | Recommended model | Step 4 outcome | Step 11 latency budget |
 |---|---|---|---|---|
-| **GPU** | Ubuntu 24.04 + CUDA NVIDIA GPU | any size that fits VRAM | PASS | a few seconds |
-| **CPU** | Ubuntu 24.04, ≥ 8 GiB RAM | Q4-quantized ≤ 3B params (Qwen 2.5 0.5B, Llama 3.2 1B/3B, Phi 3.5 Mini) | WARN (acceptable — no GPU by design) | up to 60 s for short responses |
+| **GPU** | Ubuntu 26.04 + CUDA NVIDIA GPU | any size that fits VRAM | PASS | a few seconds |
+| **CPU** | Ubuntu 26.04, ≥ 8 GiB RAM | Q4-quantized ≤ 3B params (Qwen 2.5 0.5B, Llama 3.2 1B/3B, Phi 3.5 Mini) | WARN (acceptable — no GPU by design) | up to 60 s for short responses |
 
 Both paths satisfy R1.0 acceptance. The MaluDB stack itself is
 GPU-agnostic — only `llama-cli` actually uses the GPU when one is
@@ -31,7 +31,7 @@ your model + prompt size accordingly.
 | **Field tester** | _________________________ |
 | **Date** | _________________________ |
 | **Host** | hostname / cloud / VM provider |
-| **OS** | Ubuntu 24.04.x LTS (`lsb_release -d`) |
+| **OS** | Ubuntu 26.04.x LTS (`lsb_release -d`) |
 | **Kernel** | `uname -r` |
 | **CPU** | `lscpu | head -20` |
 | **GPU** | `nvidia-smi -L` (or "none / CPU-only") |
@@ -43,7 +43,7 @@ your model + prompt size accordingly.
 
 ## 1. Provisioning checklist
 
-- [ ] Clean Ubuntu 24.04 LTS image (no prior MaluDB install).
+- [ ] Clean Ubuntu 26.04 LTS image (no prior MaluDB install).
 - [ ] At least 4 CPU cores, 20 GiB free disk.
 - [ ] **GPU path**: ≥ 4 GiB RAM, CUDA-capable NVIDIA GPU with driver installed; `nvidia-smi` works.
       **CPU path**: ≥ 8 GiB RAM (16 GiB recommended for 3B models); no GPU required.
@@ -59,7 +59,7 @@ for any step that doesn't pass on the first try.
 
 ### Step 1 — Provision
 
-Provision a clean Ubuntu 24.04 GPU server (or VM with NVIDIA
+Provision a clean Ubuntu 26.04 GPU server (or VM with NVIDIA
 passthrough) and reach a shell.
 
 - [ ] **PASS** / FAIL
@@ -72,8 +72,8 @@ Follow `install.md` §1–§3:
 ```bash
 sudo apt-get update && sudo apt-get -y upgrade
 sudo apt-get install -y git curl ca-certificates
-git clone <repo> ~/maludb-core
-cd ~/maludb-core
+git clone <repo> ~/maludb-core-26
+cd ~/maludb-core-26
 git submodule update --init --recursive
 ./scripts/maludb-bootstrap --dry-run    # plan review
 sudo ./scripts/maludb-bootstrap         # actually run
@@ -84,7 +84,7 @@ sudo ./scripts/maludb-bootstrap         # actually run
 - [ ] **PASS** / FAIL
 - Notes: ________________________________________
 
-### Step 3 — Validate PostgreSQL 17, pgvector, and `maludb_core`
+### Step 3 — Validate PostgreSQL 18, pgvector, and `maludb_core`
 
 ```bash
 psql -d maludb -c "SELECT version()"
@@ -484,8 +484,8 @@ Run the validator one more time end-to-end:
 Confirm the deterministic CI path remains green on the same checkout:
 
 ```bash
-cd ~/maludb-core
-make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+cd ~/maludb-core-26
+make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 make -C mc2dbd test
 ```
 
