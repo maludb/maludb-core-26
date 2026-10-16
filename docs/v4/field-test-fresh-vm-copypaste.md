@@ -3,7 +3,7 @@
 Every command in this file is on a **single line**. Copy a line,
 paste it into the VM shell, run it. No line continuations. This
 file is self-contained — paste straight through §1 → §13 on a
-freshly-provisioned Ubuntu 24.04 host and you land on a tagged
+freshly-provisioned Ubuntu 26.04 host and you land on a tagged
 `v4.0.0` GA.
 
 ---
@@ -35,7 +35,7 @@ sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share
 ```
 
 ```bash
-echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+printf "Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: %s-pgdg\nComponents: main\nSigned-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc\n" "$(. /etc/os-release && echo "$VERSION_CODENAME")" | sudo tee /etc/apt/sources.list.d/pgdg.sources
 ```
 
 ```bash
@@ -45,31 +45,31 @@ sudo apt-get update
 ### §2 verification
 
 ```bash
-cat /etc/apt/sources.list.d/pgdg.list
+cat /etc/apt/sources.list.d/pgdg.sources
 ```
 
-Expect a single line containing `noble-pgdg main`.
+Expect a deb822 stanza with `Suites: resolute-pgdg`.
 
 ```bash
-apt-cache policy postgresql-17 | head -10
+apt-cache policy postgresql-18 | head -10
 ```
 
-Expect `Candidate:` to point at a `pgdg24.04` version (e.g.
-`17.10-1.pgdg24.04+1`). If `Candidate:` is `(none)`, §2 didn't take
+Expect `Candidate:` to point at a `pgdg26.04` version (e.g.
+`18.6-1.pgdg26.04+2`). If `Candidate:` is `(none)`, §2 didn't take
 — re-run the §2 commands.
 
 ---
 
-## §3. Install PostgreSQL 17 + required extensions
+## §3. Install PostgreSQL 18 + required extensions
 
 ```bash
-sudo apt-get install -y postgresql-17 postgresql-server-dev-17 postgresql-17-pgvector postgresql-17-pgaudit postgresql-17-partman
+sudo apt-get install -y postgresql-18 postgresql-server-dev-18 postgresql-18-pgvector postgresql-18-pgaudit postgresql-18-partman
 ```
 
 ### §3 verification
 
 ```bash
-/usr/lib/postgresql/17/bin/pg_config --version
+/usr/lib/postgresql/18/bin/pg_config --version
 ```
 
 ```bash
@@ -80,18 +80,18 @@ sudo systemctl is-active postgresql
 psql -V
 ```
 
-Expect `PostgreSQL 17.x`, `active`, and `psql (PostgreSQL) 17.x`.
+Expect `PostgreSQL 18.x`, `active`, and `psql (PostgreSQL) 18.x`.
 
 ---
 
 ## §4. Clone the repo at the V4 RC tag
 
 ```bash
-git clone https://github.com/maludb/maludb-core.git
+git clone https://github.com/maludb/maludb-core-26.git
 ```
 
 ```bash
-cd maludb-core
+cd maludb-core-26
 ```
 
 ```bash
@@ -110,7 +110,7 @@ with "V4 rc.1").
 ## §5. Build + install the extension
 
 ```bash
-export PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+export PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
 ```bash
@@ -128,20 +128,20 @@ sudo make install PG_CONFIG="$PG_CONFIG"
 ### §5 verification
 
 ```bash
-grep default_version /usr/share/postgresql/17/extension/maludb_core.control
+grep default_version /usr/share/postgresql/18/extension/maludb_core.control
 ```
 
 Expect `default_version = '0.71.0'`.
 
 ```bash
-ls /usr/share/postgresql/17/extension/maludb_core--*.sql | wc -l
+ls /usr/share/postgresql/18/extension/maludb_core--*.sql | wc -l
 ```
 
 Expect 71 (the initial `0.1.0.sql` + 70 forward migrations from
 `0.1.0 → 0.2.0` through `0.70.0 → 0.71.0`).
 
 ```bash
-ls /usr/share/postgresql/17/extension/maludb_core--0.70.0--0.71.0.sql
+ls /usr/share/postgresql/18/extension/maludb_core--0.70.0--0.71.0.sql
 ```
 
 Expect the file to exist — that's the alpha.6 V4-REST-01 migration.
@@ -157,7 +157,7 @@ sudo scripts/maludb-bootstrap
 
 This wires `pgaudit`, `pg_stat_statements`, and any other
 preload-libraries the extension needs into
-`/etc/postgresql/17/main/postgresql.conf` via `pg_conftool` and
+`/etc/postgresql/18/main/postgresql.conf` via `pg_conftool` and
 restarts PG.
 
 ### §6 verification
@@ -218,7 +218,7 @@ shell where the venv is still activated.
 ## §9. Run pg_regress (primary V4 gate)
 
 ```bash
-make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
 **Expect the last line:** `# All 74 tests passed.`
@@ -468,7 +468,7 @@ spots):**
 ## What this PR is
 
 V4 fresh-VM GA gate. Adds the field-test sign-off report for a
-clean Ubuntu 24.04 host running the `v4.0.0-rc.1` baseline.
+clean Ubuntu 26.04 host running the `v4.0.0-rc.1` baseline.
 
 | | |
 |---|---|
@@ -591,7 +591,7 @@ checklist either way) should confirm every line:
       were committed via §14.2's force-amend path, also exactly
       two files under `docs/v4/artefacts/`. **No other files.**
 - [ ] The report's Host table identifies a freshly-provisioned
-      Ubuntu 24.04 host with no prior MaluDB state. The
+      Ubuntu 26.04 host with no prior MaluDB state. The
       `Tag under test` row reads `v4.0.0-rc.1`.
 - [ ] Every row in the Suites table is **PASS** with the
       expected count (74/74, 14/14 (4 skipped), 7/7, 4/4, 11/11,
@@ -602,7 +602,7 @@ checklist either way) should confirm every line:
       `maludb-fieldtest-v4 --json` artefact.
 - [ ] V4 bench baselines table shows recall = 1.00 (or at minimum
       ≥ 0.80) on each tree and p95 < 100 ms.
-- [ ] Acceptance criterion #2 ("fresh Ubuntu 24.04 host") is
+- [ ] Acceptance criterion #2 ("fresh Ubuntu 26.04 host") is
       flipped to **PASS** and cites this VM's hostname.
 - [ ] Traps section is either "none observed" or each entry has
       a clear (failure mode, recovery, root-cause patch target).
@@ -805,10 +805,10 @@ tag SHA matching `main` HEAD and §15.5 follow-ups are merged.
 
 ## §16. Troubleshooting
 
-### `apt-get install postgresql-17` says `E: Unable to locate package`
+### `apt-get install postgresql-18` says `E: Unable to locate package`
 
 §2 didn't run or didn't take. Re-do §2 in full and check
-`apt-cache policy postgresql-17 | head -3` lists a `pgdg24.04`
+`apt-cache policy postgresql-18 | head -3` lists a `pgdg26.04`
 candidate before retrying §3.
 
 ### `make: *** No rule to make target 'installcheck'`
@@ -825,11 +825,11 @@ make clean
 ```
 
 ```bash
-make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
 ```bash
-sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
 ### `relation "malu$X" does not exist` in a pg_regress test
@@ -873,7 +873,7 @@ You're not in `services/maludb-pageindexd`. cd there first.
 Force the include + lib paths:
 
 ```bash
-cmake -B build -S . -DCMAKE_PREFIX_PATH=/usr/lib/postgresql/17 -DLIBPQ_INCLUDE_DIRS=/usr/include/postgresql -DLIBPQ_LIBRARIES=/usr/lib/x86_64-linux-gnu/libpq.so
+cmake -B build -S . -DCMAKE_PREFIX_PATH=/usr/lib/postgresql/18 -DLIBPQ_INCLUDE_DIRS=/usr/include/postgresql -DLIBPQ_LIBRARIES=/usr/lib/x86_64-linux-gnu/libpq.so
 ```
 
 ### `scripts/maludb-fieldtest-v4: Permission denied`
@@ -905,7 +905,7 @@ and all) — then refuses to load it at preload time. To see the bad
 form:
 
 ```bash
-sudo grep shared_preload_libraries /var/lib/postgresql/17/main/postgresql.auto.conf
+sudo grep shared_preload_libraries /var/lib/postgresql/18/main/postgresql.auto.conf
 ```
 
 A bad line looks like
@@ -914,11 +914,11 @@ A bad line looks like
 bare-identifier list and restarting:
 
 ```bash
-sudo sed -i "s|shared_preload_libraries = '\"pgaudit, pg_stat_statements\"'|shared_preload_libraries = 'pgaudit,pg_stat_statements'|" /var/lib/postgresql/17/main/postgresql.auto.conf
+sudo sed -i "s|shared_preload_libraries = '\"pgaudit, pg_stat_statements\"'|shared_preload_libraries = 'pgaudit,pg_stat_statements'|" /var/lib/postgresql/18/main/postgresql.auto.conf
 ```
 
 ```bash
-sudo systemctl start postgresql@17-main
+sudo systemctl start postgresql@18-main
 ```
 
 **To set this correctly from psql in the first place**, pass bare

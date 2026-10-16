@@ -7,6 +7,35 @@ versions correspond to the extension migration chain
 
 ## Unreleased
 
+### Platform — Ubuntu 26.04 / PostgreSQL 18 (maludb-core-26)
+
+**This repository moves to Ubuntu 26.04 LTS (resolute) + PostgreSQL 18
+(PGDG).** Platform-only change: extension `default_version` stays 0.106.0
+and no SQL or C source changed. Verified on Ubuntu 26.04.1 + PostgreSQL
+18.6 (PGDG), gcc 15, Python 3.14: 104/104 `pg_regress` (source and
+packaged installs), 28/28 mc2dbd service tests, and the restd, realtimed,
+logsd, pageindexd, mcp-broker, CLI and Python driver suites. The Ubuntu
+24.04 / PostgreSQL 16–17 line continues in
+[maludb/maludb-core](https://github.com/maludb/maludb-core).
+
+- **Build:** default `pg_config` / bin / sharedir paths → PG 18 in the
+  Makefiles, bench, `maludb-force-rls`, `maludb-upgrade`, `maludb-validate`.
+- **`maludb-bootstrap`:** Ubuntu 26.04 OS gate; `PG_MAJOR` (default 18)
+  drives packages, `pg_config` and the pgaudit cluster; PGDG suite derived
+  from `VERSION_CODENAME`; writes deb822 `pgdg.sources` and treats an
+  existing `pgdg.sources` as configured (no duplicate PGDG entry).
+- **`maludb-fieldtest`:** expects Ubuntu 26.04 and PG major 18.
+- **`install-dev-env.sh`:** `PG_MAJOR` / `CLANG_MAJOR` (18 / 21), deb822
+  PGDG source. Fixes the cluster-locale probe, which used `SHOW lc_collate`
+  (gone since PG 16) and so dropped and recreated the cluster on every
+  re-run; it now reads `template1`'s collation from `pg_database`.
+- **Debian packaging:** `debian/pgversions` = 18; only
+  `postgresql-18-maludb-core` + `maludb-mc2dbd` are built; mc2dbd links PG 18
+  libpq; new `0.106.0-1 resolute` changelog entry.
+- **CI:** all jobs on `ubuntu-26.04`; PG matrix is 18 only (required, no
+  longer allowed-fail); sanitizer and static-analysis jobs on PG 18 with
+  clang-21.
+
 ### 0.106.0
 
 **The engine learns who is asking: principals, scopes and a sensitivity ceiling

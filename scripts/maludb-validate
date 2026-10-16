@@ -106,7 +106,7 @@ fi
 #     does not exist" bugs). Catch the skew here.
 # ---------------------------------------------------------------------
 SHAREDIR=$(pg_config --sharedir 2>/dev/null || true)
-[ -d "${SHAREDIR}/extension" ] || SHAREDIR=/usr/share/postgresql/17
+[ -d "${SHAREDIR}/extension" ] || SHAREDIR=/usr/share/postgresql/18
 CONTROL="${SHAREDIR}/extension/maludb_core.control"
 if [ -n "$EXTVER" ] && [ -r "$CONTROL" ]; then
     HOSTVER=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" "$CONTROL")

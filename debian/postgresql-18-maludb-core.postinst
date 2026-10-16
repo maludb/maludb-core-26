@@ -1,5 +1,8 @@
 #!/bin/sh
 # Postinst for postgresql-18-maludb-core.
+#
+# We do NOT auto-CREATE EXTENSION here. The DBA owns when extensions
+# enter a database. Print a one-liner pointing at the right command.
 
 set -e
 

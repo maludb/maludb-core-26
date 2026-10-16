@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# install-dev-env.sh — Stage 1 dev-environment bring-up on Ubuntu 24.04 LTS.
+# install-dev-env.sh — Stage 1 dev-environment bring-up on Ubuntu 26.04 LTS.
 #
-# Installs PGDG PostgreSQL 17 + dev headers (PG 16 + 17), C/Clang toolchain,
+# Installs PGDG PostgreSQL 18 + dev headers, C/Clang toolchain,
 # pgvector / pgaudit / pg_partman, recreates the default cluster with
 # C.UTF-8 / UTF8 for stable regression-test sort order, and grants the
 # invoking user a PG superuser role.
@@ -27,48 +27,61 @@ if [[ -z "$TARGET_USER" || "$TARGET_USER" == "root" ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+PG_MAJOR="${PG_MAJOR:-18}"
+CLANG_MAJOR="${CLANG_MAJOR:-21}"
 
 phase() { echo; echo "===== $* ====="; date -Iseconds; }
 
 phase "Phase 1: PGDG apt repository"
-if [[ ! -f /etc/apt/sources.list.d/pgdg.list ]]; then
+# Accept either the legacy pgdg.list or the deb822 pgdg.sources (26.04 default).
+if [[ ! -f /etc/apt/sources.list.d/pgdg.list && ! -f /etc/apt/sources.list.d/pgdg.sources ]]; then
   install -d /usr/share/postgresql-common/pgdg
   curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-  echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
-    > /etc/apt/sources.list.d/pgdg.list
+  PGDG_SUITE="$(. /etc/os-release && echo "${VERSION_CODENAME}")-pgdg"
+  cat > /etc/apt/sources.list.d/pgdg.sources <<EOS
+Types: deb
+URIs: https://apt.postgresql.org/pub/repos/apt
+Suites: ${PGDG_SUITE}
+Components: main
+Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+EOS
 fi
 apt-get update -qq
-apt-cache policy postgresql-17 | sed -n '1,5p'
+apt-cache policy "postgresql-${PG_MAJOR}" | sed -n '1,5p'
 
 phase "Phase 2: compiler toolchain & build deps"
 apt-get install -y --no-install-recommends \
   build-essential \
-  clang-18 clang-tools-18 clang-tidy-18 llvm-18-dev \
+  "clang-${CLANG_MAJOR}" "clang-tools-${CLANG_MAJOR}" "clang-tidy-${CLANG_MAJOR}" "llvm-${CLANG_MAJOR}-dev" \
   pkg-config bison flex \
   libicu-dev libssl-dev libreadline-dev zlib1g-dev liblz4-dev libzstd-dev libxml2-dev \
+  libpq-dev libmicrohttpd-dev libjansson-dev libgnutls28-dev libcurl4-openssl-dev \
   lcov gcovr cppcheck \
   ca-certificates curl gnupg
 
-phase "Phase 3: PostgreSQL 17 + dev headers (PG 16 + 17)"
+phase "Phase 3: PostgreSQL ${PG_MAJOR} + dev headers"
 apt-get install -y \
-  postgresql-17 postgresql-client-17 \
-  postgresql-server-dev-17 \
-  postgresql-server-dev-16 \
+  "postgresql-${PG_MAJOR}" "postgresql-client-${PG_MAJOR}" \
+  "postgresql-server-dev-${PG_MAJOR}" \
   postgresql-server-dev-all \
   postgresql-common
 
 phase "Phase 4: extensions (pgvector, pgaudit, pg_partman)"
 apt-get install -y \
-  postgresql-17-pgvector \
-  postgresql-17-pgaudit \
-  postgresql-17-partman
+  "postgresql-${PG_MAJOR}-pgvector" \
+  "postgresql-${PG_MAJOR}-pgaudit" \
+  "postgresql-${PG_MAJOR}-partman"
 
-phase "Phase 5: recreate cluster 17/main with C.UTF-8 / UTF8"
+phase "Phase 5: recreate cluster ${PG_MAJOR}/main with C.UTF-8 / UTF8"
 # Only recreate if the existing cluster is not already C.UTF-8 / UTF8.
 need_recreate=1
-if pg_lsclusters -h 2>/dev/null | awk '$1=="17" && $2=="main"' | grep -q .; then
-  current="$(sudo -u postgres psql -tAc "SHOW lc_collate; SHOW server_encoding;" 2>/dev/null | tr '\n' '|' || true)"
+if pg_lsclusters -h 2>/dev/null | awk -v v="$PG_MAJOR" '$1==v && $2=="main"' | grep -q .; then
+  # lc_collate was removed as a GUC in PG 16; read the template1 collation
+  # from the catalog instead (an empty result here would drop the cluster).
+  current="$(sudo -u postgres psql --cluster "${PG_MAJOR}/main" -tAc \
+    "SELECT datcollate || '|' || pg_encoding_to_char(encoding) || '|' FROM pg_database WHERE datname = 'template1';" \
+    2>/dev/null || true)"
   echo "current cluster locale|encoding: $current"
   if [[ "$current" == *"C.UTF-8|UTF8|"* || "$current" == *"C.utf8|UTF8|"* ]]; then
     need_recreate=0
@@ -76,11 +89,11 @@ if pg_lsclusters -h 2>/dev/null | awk '$1=="17" && $2=="main"' | grep -q .; then
   fi
 fi
 if [[ "$need_recreate" -eq 1 ]]; then
-  if pg_lsclusters -h 2>/dev/null | awk '$1=="17" && $2=="main"' | grep -q .; then
-    pg_dropcluster --stop 17 main
+  if pg_lsclusters -h 2>/dev/null | awk -v v="$PG_MAJOR" '$1==v && $2=="main"' | grep -q .; then
+    pg_dropcluster --stop "$PG_MAJOR" main
   fi
-  pg_createcluster --locale C.UTF-8 --encoding UTF8 17 main
-  pg_ctlcluster 17 main start
+  pg_createcluster --locale C.UTF-8 --encoding UTF8 "$PG_MAJOR" main
+  pg_ctlcluster "$PG_MAJOR" main start
 fi
 pg_lsclusters
 
@@ -94,19 +107,17 @@ sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$TARGET_USE
 
 phase "Phase 7: verification"
 echo "--- pg_config ---"
-/usr/lib/postgresql/17/bin/pg_config --version
-/usr/lib/postgresql/17/bin/pg_config --pgxs
+"/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" --version
+"/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" --pgxs
 echo "--- psql ---"
 psql --version
 echo "--- clusters ---"
 pg_lsclusters
 echo "--- toolchain ---"
 gcc --version | sed -n '1p'
-clang-18 --version | sed -n '1p'
-clang-tidy-18 --version | sed -n '1p'
-scan-build-18 --help 2>&1 | sed -n '1p' || true
-echo "--- PG 16 headers present? ---"
-ls /usr/lib/postgresql/16/bin/pg_config 2>/dev/null && /usr/lib/postgresql/16/bin/pg_config --version || echo "PG16 pg_config not found"
+"clang-${CLANG_MAJOR}" --version | sed -n '1p'
+"clang-tidy-${CLANG_MAJOR}" --version | sed -n '1p'
+"scan-build-${CLANG_MAJOR}" --help 2>&1 | sed -n '1p' || true
 echo "--- pgvector smoke test (as $TARGET_USER) ---"
 sudo -u "$TARGET_USER" psql -d "$TARGET_USER" <<'SQL'
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -115,6 +126,6 @@ SELECT '[1,2,3]'::vector <-> '[1,2,4]'::vector AS l2_distance;
 DROP EXTENSION vector;
 SQL
 echo "--- pgaudit + pg_partman package presence ---"
-dpkg -l postgresql-17-pgaudit postgresql-17-partman | tail -2
+dpkg -l "postgresql-${PG_MAJOR}-pgaudit" "postgresql-${PG_MAJOR}-partman" | tail -2
 
 phase "DONE — log: $LOG"

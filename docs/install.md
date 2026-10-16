@@ -1,7 +1,7 @@
 # MaluDB v4.0.0 — Detailed Install Guide
 
 This is the operator-grade install playbook for MaluDB v4.0.0 on a
-clean Ubuntu 24.04 LTS server. Every step has the exact command, the
+clean Ubuntu 26.04 LTS server. Every step has the exact command, the
 expected output, the pass criterion, and a troubleshooting note for
 the most likely failure mode. If you're following this end-to-end as
 the field test, also read [`field-test.md`](field-test.md) for the
@@ -9,7 +9,7 @@ acceptance procedure that wraps this guide.
 
 > **Field-test note.** The bootstrap script in this guide has been
 > exercised step by step on the build host. The very-first install on
-> a *clean* Ubuntu 24.04 server is the field-test step. If anything
+> a *clean* Ubuntu 26.04 server is the field-test step. If anything
 > deviates from the expected output below, **stop, capture the diff,
 > and report it** rather than papering over.
 
@@ -19,7 +19,7 @@ acceptance procedure that wraps this guide.
 
 | | |
 |---|---|
-| **OS** | Ubuntu 24.04 LTS (Noble Numbat). x86_64 or arm64. |
+| **OS** | Ubuntu 26.04 LTS (Resolute Raccoon). x86_64 or arm64. |
 | **CPU** | 4 cores recommended; 2 cores minimum. |
 | **RAM** | 4 GiB minimum for the listener + DB. ≥ 8 GiB recommended on a CPU-only host running a small local model (Qwen 2.5 0.5B / Llama 3.2 1B); 16 GiB for 3B-class models. |
 | **Disk** | 20 GiB free for PG + extension + build artifacts. Add model size for local llama. |
@@ -46,12 +46,12 @@ Expected:
 
 ```
 Distributor ID: Ubuntu
-Description:    Ubuntu 24.04.x LTS
-Release:        24.04
-Codename:       noble
+Description:    Ubuntu 26.04.x LTS
+Release:        26.04
+Codename:       resolute
 ```
 
-Pass criterion: `Release: 24.04`. If you see something else, stop here
+Pass criterion: `Release: 26.04`. If you see something else, stop here
 unless you've consciously decided to test on a different distro.
 
 ### 1.2 Update apt
@@ -92,8 +92,8 @@ sudo rm /etc/sudoers.d/$USER-fieldtest
 ### 2.1 Clone
 
 ```bash
-git clone https://github.com/maludb/maludb-core.git ~/maludb-core
-cd ~/maludb-core
+git clone https://github.com/maludb/maludb-core-26.git ~/maludb-core-26
+cd ~/maludb-core-26
 ```
 
 ### 2.2 Initialize submodules
@@ -151,12 +151,12 @@ Sample output (abbreviated):
 
 ```
 ==> Preflight
-    ✓ Ubuntu 24.04 detected
+    ✓ Ubuntu 26.04 detected
     ✓ Repo root: /home/$USER/maludb-core
 
 ==> Installing apt dependencies
     ✓ PGDG repo configured
-    ✓ Installed: postgresql-17 postgresql-server-dev-17 postgresql-17-pgvector postgresql-17-pgaudit postgresql-17-partman ...
+    ✓ Installed: postgresql-18 postgresql-server-dev-18 postgresql-18-pgvector postgresql-18-pgaudit postgresql-18-partman ...
 
 ==> Building maludb_core (PGXS) and maludb_mc2dbd
     ✓ maludb_core built
@@ -200,12 +200,12 @@ exits 0. Re-running should produce mostly cyan `·` (skip) lines.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `E: Unable to locate package postgresql-17` | PGDG repo step failed silently. | `cat /etc/apt/sources.list.d/pgdg.list` should contain `noble-pgdg main`. Re-run `sudo apt-get update` and look for HTTP errors. |
-| `make: *** No rule to make target 'install'.` | You ran bootstrap from a directory other than the repo root. | `cd ~/maludb-core && sudo ./scripts/maludb-bootstrap` |
+| `E: Unable to locate package postgresql-18` | PGDG repo step failed silently. | `cat /etc/apt/sources.list.d/pgdg.sources` (deb822, written by bootstrap and by `apt.postgresql.org.sh`) should contain `Suites: resolute-pgdg`; an older one-line `pgdg.list` should contain `resolute-pgdg main`. Re-run `sudo apt-get update` and look for HTTP errors. |
+| `make: *** No rule to make target 'install'.` | You ran bootstrap from a directory other than the repo root. | `cd ~/maludb-core-26 && sudo ./scripts/maludb-bootstrap` |
 | Bootstrap stops immediately after `==> Configuring pgaudit preload` | Older bootstrap code aborted when `shared_preload_libraries` or `pgaudit.log` was unset on a fresh cluster. | Pull a revision that includes the pgaudit preload fix, then re-run `sudo ./scripts/maludb-bootstrap`. |
-| `psql: error: FATAL: Peer authentication failed` | The cluster's `pg_hba.conf` doesn't have a `local all all peer` line. | The default Ubuntu PG install does have this. If you've customized, add: `local all all peer` to `/etc/postgresql/17/main/pg_hba.conf`, then `sudo systemctl reload postgresql`. |
+| `psql: error: FATAL: Peer authentication failed` | The cluster's `pg_hba.conf` doesn't have a `local all all peer` line. | The default Ubuntu PG install does have this. If you've customized, add: `local all all peer` to `/etc/postgresql/18/main/pg_hba.conf`, then `sudo systemctl reload postgresql`. |
 | `useradd: user 'maludb_mc2dbd' already exists` followed by failure | A previous partial install left the user; the script should `skip`, but a different shell or group was set. | `sudo userdel maludb_mc2dbd && sudo userdel maludb_modeld && sudo groupdel maludb`, then re-run. |
-| `cd '/usr/lib/postgresql/17/lib/bitcode' && ... llvm-lto ...` exits non-zero | LLVM JIT build step failed. | Verify `dpkg -l llvm-19-runtime` shows installed. The `postgresql-server-dev-17` package pulls it; if missing, `sudo apt-get install -y llvm-19-runtime`. |
+| `cd '/usr/lib/postgresql/18/lib/bitcode' && ... llvm-lto ...` exits non-zero | LLVM JIT build step failed. | Verify `dpkg -l llvm-21-runtime` shows installed. The `postgresql-server-dev-18` package pulls it; if missing, `sudo apt-get install -y llvm-21-runtime`. |
 
 ---
 
@@ -220,7 +220,7 @@ exits 0. Re-running should produce mostly cyan `·` (skip) lines.
 Expected (the listener isn't started yet, so its checks WARN):
 
 ```
-PASS  PostgreSQL reachable (PostgreSQL 17.x ...)
+PASS  PostgreSQL reachable (PostgreSQL 18.x ...)
 PASS  maludb_core 0.71.0 installed
 PASS  pgvector demo table reachable
 WARN  pgvector demo table empty (ok if no rows inserted yet)
@@ -866,7 +866,7 @@ automatically.
 
 | Service | Log location |
 |---|---|
-| PostgreSQL 17 | `/var/log/postgresql/postgresql-17-main.log` |
+| PostgreSQL 18 | `/var/log/postgresql/postgresql-18-main.log` |
 | `maludb-mc2dbd` | `journalctl -u maludb-mc2dbd` |
 | `maludb-modeld` | `journalctl -u maludb-modeld` |
 | MaluDB invocation audit (DB) | `SELECT * FROM maludb_core.malu$mc2db_invocation ORDER BY started_at DESC LIMIT 10;` |
@@ -892,13 +892,13 @@ DROP DATABASE IF EXISTS maludb;
 DROP ROLE IF EXISTS maludb_mc2dbd;
 DROP ROLE IF EXISTS maludb_modeld;
 SQL
-sudo make -C ~/maludb-core uninstall PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config 2>/dev/null
+sudo make -C ~/maludb-core-26 uninstall PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config 2>/dev/null
 ```
 
-PG 17 itself stays installed; if you need to remove it too:
+PG 18 itself stays installed; if you need to remove it too:
 
 ```bash
-sudo apt-get -y purge postgresql-17 postgresql-17-pgvector postgresql-17-pgaudit postgresql-17-partman postgresql-server-dev-17
+sudo apt-get -y purge postgresql-18 postgresql-18-pgvector postgresql-18-pgaudit postgresql-18-partman postgresql-server-dev-18
 sudo apt-get -y autoremove
 ```
 

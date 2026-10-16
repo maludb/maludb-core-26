@@ -17,7 +17,7 @@ Status: **alpha, first cut.** v0.1.0 covers ~12 functions; the full
 | libpq | >= 16 (PGDG headers are fine) |
 | Build system | gcc / clang with `-Wall -Wextra` clean |
 
-On Ubuntu 24.04:
+On Ubuntu 26.04:
 
 ```bash
 sudo apt install libpq-dev cmake build-essential pkg-config

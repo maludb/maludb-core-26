@@ -9,7 +9,7 @@ the product surface that exists in this repository.
 
 ## 1. Current Scope
 
-MaluDB is a memory DBMS built on PostgreSQL 17. It is delivered as:
+MaluDB is a memory DBMS built on PostgreSQL 18. It is delivered as:
 
 - `maludb_core`, a PostgreSQL extension containing C code, SQL objects,
   PL/pgSQL APIs, catalog tables, vector helpers, Session Context, the memory
@@ -28,7 +28,7 @@ MaluDB is a memory DBMS built on PostgreSQL 17. It is delivered as:
   MCP tools.
 - C, Python, Node.js, and PHP SDKs.
 - Bootstrap, validation, field-test, packaging, and systemd assets for Ubuntu
-  24.04 LTS.
+  26.04 LTS.
 
 ### 1.1 Current Version
 
@@ -36,8 +36,8 @@ MaluDB is a memory DBMS built on PostgreSQL 17. It is delivered as:
 |---|---|
 | Extension `default_version` | **0.106.0** (0.106.0: principals and scopes inside a tenant — the session names who is asking and the engine enforces that principal's scopes and sensitivity ceiling on reads, writes and search; forgetting works on every search path; skill review state, principal grants and load events; pool presence facades — see `docs/principal-scoping.md`; re-run `enable_memory_schema` per tenant; 0.105.3: text comparisons in functions called with a `name` argument use their indexes — the per-statement dirty-queue purge and memory search no longer scan a schema's rows; 0.105.2: foreign-key indexes for the extension's bulk deletes — source packages, community replacement, ANN-indexed compartments; 0.105.1: `malu_vector` text output reads back exactly, so dumps and copies keep embeddings bit for bit; 0.105.0: `pg_dump` carries MaluDB's data — data tables registered with `pg_extension_config_dump`, installed rows and per-database secrets excluded; 0.101.0–0.104.0: unified-graph path finding, graph communities and analytics, in-core graph import, and the relational data-model graph — see CHANGELOG; on 0.100.0 document/note reindex protocol: a background worker re-derives a document's/note's SVPOR graph footprint against the current graph via `maludb_memory_reindex_claim` → `maludb_memory_reindex_apply` (replace the `$source`-anchored statement footprint, re-ingest idempotently with the document section stripped; shared subjects/verbs merge; embeddings refresh via the 0.95.0 dirty-queue triggers), with `last_indexed`/`last_indexed_model` watermarks on `malu$document` — the documents/notes analogue of the 0.99.0 skill reindex; core never calls a model — on 0.99.0 skill reindex protocol: a background worker re-derives a skill's discovery tags against the current graph via `maludb_skill_reindex_claim` → `maludb_skill_reindex_apply` (replace-`extracted`, preserves curator `manual` tags), with `last_indexed`/`last_indexed_model` watermarks on `malu$skill_package`; core never calls a model — a `claim → apply` contract an external worker drives — on 0.98.0 note retrieval by subject/verb: one-call `maludb_note_search` over extracted SVO edges — subject patterns against both statement endpoints, verb-exact/verb-like bidirectional containment, both statement→document rails, one row per note with matched edges aggregated — plus deterministic `maludb_note_query_parse` free-text parsing against the tenant verb catalog — on 0.97.0 agent-skill distribution, 0.96.0 event kinds as first-class subject types, and the 0.95.0 semantic spine; earlier: episodes-as-subjects, memory-model episodes/attributes, vector compartments, in-database model gateway, link helpers, one-call extraction ingest; V4 acceptance artefacts remain `scripts/maludb-fieldtest-v4`, `bench/v4/run-bench`, and `docs/v4/acceptance-matrix.md`) |
 | Last release tag | **`v4.5.0`** at extension `0.100.0` (skill + document/note reindex protocols, agent-skill distribution, note retrieval; 2026-06-17) |
-| Supported PostgreSQL majors | 16, 17, 18 (PG 17 is the blocking CI target) |
-| Test suite | 91 `pg_regress` targets on PG 17 + restd / realtimed / CLI / libmaludb v0.2 / pageindexd parser smoke |
+| Supported PostgreSQL majors | 18 (Ubuntu 26.04; the 24.04 / PG 16-17 line is maludb/maludb-core) |
+| Test suite | 104 `pg_regress` targets on PG 18 + restd / realtimed / CLI / libmaludb v0.2 / pageindexd parser smoke |
 | Shipped services | `maludb_modeld`, `maludb_mc2dbd`, `mcp-broker`, `maludb-restd`, `maludb-realtimed`, `maludb-pageindexd` |
 | Shipped SDKs | C (`libmaludb` v0.2.0 — pool/skill/node wrappers), Python, Node.js, PHP (`maludb/client` via Composer) |
 | Shipped CLI | `maludb` v0.1.0 (V3-CLI-01) |
@@ -90,7 +90,7 @@ MaluDB keeps PostgreSQL as the durable authority.
 
 | Component | Role |
 |---|---|
-| PostgreSQL 17 | Base database engine, MVCC, WAL, SQL, roles, extensions. |
+| PostgreSQL 18 | Base database engine, MVCC, WAL, SQL, roles, extensions. |
 | `maludb_core` | Extension schema, catalog tables, C helpers, SQL APIs, regression-tested behavior. |
 | `pgvector` | Required dependency for the base vector smoke table and exact compartment search. |
 | `maludb_modeld` | Out-of-backend model execution daemon for local runtime requests. |
@@ -106,7 +106,7 @@ isolation boundary.
 
 ## 3. Requirements
 
-This section assumes Ubuntu 24.04 LTS is already installed. The bootstrap in
+This section assumes Ubuntu 26.04 LTS is already installed. The bootstrap in
 section 4 installs the normal operator requirements automatically; use the
 commands below when preparing a host manually or debugging a dependency issue.
 Do not run every command in section 3 and then repeat section 4.1 as a single
@@ -119,9 +119,9 @@ sudo apt-get update
 sudo apt-get install -y git curl ca-certificates jq openssl
 ```
 
-### 3.2 PostgreSQL 17 From PGDG
+### 3.2 PostgreSQL 18 From PGDG
 
-MaluDB targets PostgreSQL 17 from the PostgreSQL Global Development Group apt
+MaluDB targets PostgreSQL 18 from the PostgreSQL Global Development Group apt
 repository, not the older PostgreSQL packages from the stock Ubuntu repo.
 
 ```bash
@@ -129,20 +129,25 @@ sudo install -d /usr/share/postgresql-common/pgdg
 sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
   -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
 
-echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
-https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | \
-  sudo tee /etc/apt/sources.list.d/pgdg.list
+# deb822 source; the suite is derived from this host's codename (resolute-pgdg on 26.04)
+sudo tee /etc/apt/sources.list.d/pgdg.sources >/dev/null <<EOF
+Types: deb
+URIs: https://apt.postgresql.org/pub/repos/apt
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg
+Components: main
+Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+EOF
 
 sudo apt-get update
 sudo apt-get install -y \
-  postgresql-17 postgresql-client-17 \
-  postgresql-server-dev-17 postgresql-server-dev-all
+  postgresql-18 postgresql-client-18 \
+  postgresql-server-dev-18 postgresql-server-dev-all
 ```
 
 Verify:
 
 ```bash
-/usr/lib/postgresql/17/bin/pg_config --version
+/usr/lib/postgresql/18/bin/pg_config --version
 psql -V
 pg_lsclusters
 ```
@@ -151,9 +156,9 @@ pg_lsclusters
 
 ```bash
 sudo apt-get install -y \
-  postgresql-17-pgvector \
-  postgresql-17-pgaudit \
-  postgresql-17-partman
+  postgresql-18-pgvector \
+  postgresql-18-pgaudit \
+  postgresql-18-partman
 ```
 
 `pgvector` is a hard dependency of `maludb_core`. `pgaudit` and `pg_partman`
@@ -175,7 +180,7 @@ Developer and static-analysis tools:
 
 ```bash
 sudo apt-get install -y \
-  clang-18 clang-tools-18 clang-tidy-18 llvm-18-dev \
+  clang-21 clang-tools-21 clang-tidy-21 llvm-21-dev \
   lcov gcovr cppcheck
 ```
 
@@ -196,8 +201,8 @@ For local model execution, first check out the MaluDB repository, then build
 the vendored `llama.cpp` runtime from the repository root:
 
 ```bash
-git clone <maludb-core-url> ~/maludb-core
-cd ~/maludb-core
+git clone <maludb-core-url> ~/maludb-core-26
+cd ~/maludb-core-26
 git submodule update --init --recursive
 make -C runtime
 ```
@@ -267,11 +272,11 @@ Then run the local runtime check:
 
 ### 4.1 Fresh Ubuntu Bootstrap
 
-From a clean Ubuntu 24.04 host:
+From a clean Ubuntu 26.04 host:
 
 ```bash
-git clone <maludb-core-url> ~/maludb-core
-cd ~/maludb-core
+git clone <maludb-core-url> ~/maludb-core-26
+cd ~/maludb-core-26
 git submodule update --init --recursive
 
 ./scripts/maludb-bootstrap --dry-run
@@ -282,12 +287,12 @@ If you already cloned the repository while following section 3.6, do not clone
 it again. Start from:
 
 ```bash
-cd ~/maludb-core
+cd ~/maludb-core-26
 ./scripts/maludb-bootstrap --dry-run
 sudo ./scripts/maludb-bootstrap
 ```
 
-The bootstrap installs PostgreSQL 17, required PostgreSQL extensions, build
+The bootstrap installs PostgreSQL 18, required PostgreSQL extensions, build
 dependencies, `maludb_core`, service users, config files, service binaries, and
 systemd units.
 
@@ -299,11 +304,11 @@ sudo make bootstrap
 
 ### 4.2 Manual Extension Build
 
-For development on a host that already has PostgreSQL 17 and pgvector:
+For development on a host that already has PostgreSQL 18 and pgvector:
 
 ```bash
-make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
 Create the extension in a database:
@@ -364,7 +369,7 @@ PostgreSQL regression suite:
 
 ```bash
 sudo --preserve-env make installcheck \
-  PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+  PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 ```
 
 MC2DB listener service tests:
@@ -1189,7 +1194,7 @@ journalctl -u maludb-modeld -n 100 --no-pager
 PostgreSQL logs:
 
 ```text
-/var/log/postgresql/postgresql-17-main.log
+/var/log/postgresql/postgresql-18-main.log
 ```
 
 MC2DB audit:
@@ -1235,10 +1240,10 @@ Test restores regularly.
 
 ### `CREATE EXTENSION maludb_core` fails because `vector` is missing
 
-Install pgvector for PostgreSQL 17:
+Install pgvector for PostgreSQL 18:
 
 ```bash
-sudo apt-get install -y postgresql-17-pgvector
+sudo apt-get install -y postgresql-18-pgvector
 ```
 
 Then retry:

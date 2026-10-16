@@ -17,9 +17,9 @@ tag is approved.
 | | |
 |---|---|
 | Hostname             | `<HOSTNAME>` |
-| OS                   | Ubuntu 24.04.<minor> LTS (Noble, freshly provisioned, no prior MaluDB state) |
+| OS                   | Ubuntu 26.04.<minor> LTS (Resolute, freshly provisioned, no prior MaluDB state) |
 | Arch                 | `<x86_64 or arm64>` |
-| PostgreSQL           | 17.<x> (PGDG `noble-pgdg`, package `<exact version>`) |
+| PostgreSQL           | 18.<x> (PGDG `resolute-pgdg`, package `<exact version>`) |
 | Extension            | `maludb_core` 0.71.0 |
 | Tag under test       | `v4.0.0-rc.1` |
 | HEAD at test time    | `<commit-sha>` (`<commit subject>`) |
@@ -46,7 +46,7 @@ means we don't tag v4.0.0 — fix on `main`, re-run, update this report.
 
 | Suite | Expected | Result | Notes |
 |---|---|---|---|
-| `make installcheck` (PG 17, default build) | **74/74 pass** | `<XX/74>` | All Stage 1–7 + V3 Stage 8–15 + V4 Stage 16–19 regression files. |
+| `make installcheck` (PG 18, default build) | **104/104 pass** | `<XX/104>` | All Stage 1–7 + V3 Stage 8–15 + V4 Stage 16–19 regression files. |
 | `services/maludb-restd/tests/test_smoke.py` | **7/7 pass** | `<X/7>` | V3 surface — should still be green. |
 | `services/maludb-realtimed/tests/test_smoke.py` | **4/4 pass** | `<X/4>` | V3 surface — should still be green. |
 | `services/maludb-pageindexd/tests/` (parser smokes) | **14/14 pass** | `<XX/14>` | V4-PARSER-01 unittests. Requires `python3-pypdf` apt package. |
@@ -116,14 +116,14 @@ the deterministic `overlap` strategy on the fixture corpus.
 | # | Criterion | Result |
 |---|---|---|
 | 1 | Docs agree on shipped version / surface / tag | `<PASS/FAIL>` |
-| 2 | Fresh Ubuntu 24.04 host installs, starts services, passes field test | `<PASS/FAIL>` — **this run** |
+| 2 | Fresh Ubuntu 26.04 host installs, starts services, passes field test | `<PASS/FAIL>` — **this run** |
 | 3 | REST / MC2DB / CLI / SDKs share V3-AUTH-01 token model with identical RLS | `<PASS/FAIL>` |
 | 4 | Re-derivation produces supersession edge; leaf ranges unchanged; new summaries | `<PASS/FAIL>` — `sql/page_index_catalog.sql` + `sql/chat_index_catalog.sql` |
 | 5 | V3-EMBED-01 chunker handoff aligned 1:1 with tree leaves | `<PASS — API surface; bench-deferred>` |
 | 6 | Tree descent authz-enforced at planning / expansion / assembly | `<PASS/FAIL>` — `sql/page_index_descent.sql` |
 | 7 | Every tree node, structure-pass run, ChatIndex append has Derivation Ledger entry | `<PASS/FAIL>` |
 | 8 | ChatIndex incremental append byte-equivalent to one-shot ingest | `<PASS/FAIL>` — `sql/chat_index_append.sql` |
-| 9 | pg_regress passes on PG 17; V4 service / SDK smoke tests pass; bench fixtures publish baselines | `<PASS/FAIL>` |
+| 9 | pg_regress passes on PG 18; V4 service / SDK smoke tests pass; bench fixtures publish baselines | `<PASS/FAIL>` |
 | 10 | ASan / UBSan / clang-tidy / scan-build add no new warnings for V4-touched C code | `<PASS — vacuous; V4 adds no extension C>` |
 | 11 | `.deb` artifact set extends to include maludb-pageindexd_X.Y.Z-1_amd64.deb | **deferred** — same posture as V3 Python services |
 
@@ -147,7 +147,7 @@ If nothing tripped, write "none observed" and move on.
 ## Verdict
 
 V4 is **`<FIELD-TEST GREEN / BLOCKED>`** on a freshly-provisioned
-Ubuntu 24.04 host (`<HOSTNAME>`) at HEAD `<sha>` over the
+Ubuntu 26.04 host (`<HOSTNAME>`) at HEAD `<sha>` over the
 `v4.0.0-rc.1` baseline. All 11 V4 acceptance criteria are
 `<PASS/PASS-DEFERRED/FAIL>`.
 

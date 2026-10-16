@@ -41,8 +41,8 @@ Pull requests without DCO sign-off on every commit will not be merged.
 
 ## Before you open a PR
 
-1. `make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config`
-   passes (74/74 pg_regress on PG 17).
+1. `make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config`
+   passes (104/104 pg_regress on PG 18).
 2. For driver / service changes, the corresponding smoke suite passes
    (see the suite tallies in `README.md`).
 3. New behaviour has a `pg_regress` test under `sql/` and `expected/`,

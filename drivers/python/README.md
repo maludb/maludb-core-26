@@ -15,7 +15,7 @@ pip install maludb
 Or from this source tree:
 
 ```bash
-# One-time host setup on Ubuntu 24.04:
+# One-time host setup on Ubuntu 26.04:
 sudo apt install python3-venv
 
 cd drivers/python

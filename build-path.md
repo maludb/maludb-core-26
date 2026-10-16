@@ -9,8 +9,8 @@ The build path is subordinate to `requirements.md`. If this file conflicts with 
 - Stay inside the current stage unless the prompt explicitly expands scope.
 - Do not install Stage N+1 objects in Stage N extension SQL.
 - Use PGXS, not Meson or CMake.
-- Use PostgreSQL 17 from PGDG as the baseline runtime.
-- Keep PG 16 compatibility and add PG 18 compatibility when dependencies validate.
+- Use PostgreSQL 18 from PGDG as the baseline runtime.
+- PG 18 on Ubuntu 26.04 is the only target in this repository; the Ubuntu 24.04 / PG 16–17 line is maintained in maludb/maludb-core.
 - Use PostgreSQL backend APIs in C code: `palloc`, `ereport`, PostgreSQL transaction APIs, PostgreSQL version macros.
 - Do not perform model inference, external MCP tool execution, external network calls, or arbitrary process execution inside ordinary PostgreSQL backend processes. The early model runtime is a governed companion service plus SQL/session extension surface; MC2DB is a governed listener extension/service; MC2DB stored procedures may emit only to the active MC2DB response context through package-like APIs such as `mc2db.put_object`.
 - Preserve provenance for every derived object.
@@ -37,11 +37,11 @@ Read these before changing code or requirements:
 Use the narrowest verification command that proves the change, then broaden confidence when the stage is ready.
 
 ```bash
-make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-sudo --preserve-env make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-make COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g" PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-scan-build-18 make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-clang-tidy-18 src/*.c -- $(/usr/lib/postgresql/17/bin/pg_config --cflags) -I$(/usr/lib/postgresql/17/bin/pg_config --includedir-server)
+make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+sudo --preserve-env make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+make COPT="-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g" PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+scan-build-21 make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+clang-tidy-21 src/*.c -- $(/usr/lib/postgresql/18/bin/pg_config --cflags) -I$(/usr/lib/postgresql/18/bin/pg_config --includedir-server)
 git diff --check
 ```
 

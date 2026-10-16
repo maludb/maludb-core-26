@@ -1,22 +1,20 @@
 # MaluDB Debian packaging
 
-Four binary packages ship from a single `dpkg-buildpackage` invocation:
+Two binary packages ship from a single `dpkg-buildpackage` invocation
+(Ubuntu 26.04 / PostgreSQL 18; the 24.04 / PG 16–17 packaging lives in
+[maludb/maludb-core](https://github.com/maludb/maludb-core)):
 
 | Package | Contents |
 |---|---|
-| `postgresql-16-maludb-core` | The PGXS extension built for PostgreSQL 16. |
-| `postgresql-17-maludb-core` | The PGXS extension built for PostgreSQL 17. |
 | `postgresql-18-maludb-core` | The PGXS extension built for PostgreSQL 18. |
 | `maludb-mc2dbd` | The MC2DB listener daemon (`maludb_mc2dbd`) + systemd unit, with the four implementation_type dispatchers wired (`sql_function`, `external_exec`, `mcp_proxy`, `http_endpoint`). |
 
-Each `postgresql-N-maludb-core` package carries `maludb_core.so`,
+The `postgresql-18-maludb-core` package carries `maludb_core.so`,
 `maludb_core.control`, and every `maludb_core--X.Y--X.Z.sql`
 migration script (72 SQL extension scripts in v0.71.0) under
-`/usr/lib/postgresql/N/` and `/usr/share/postgresql/N/extension/`.
-Operators install exactly the per-version package matching their
-PG major.
+`/usr/lib/postgresql/18/` and `/usr/share/postgresql/18/extension/`.
 
-The build host MUST be Ubuntu 24.04 (LTS noble) with PGDG installed.
+The build host MUST be Ubuntu 26.04 (LTS resolute) with PGDG installed.
 See [docs/install.md §0](install.md) for the base-host requirements.
 
 ## Build
@@ -36,12 +34,10 @@ Flags:
 Output lands in the parent directory:
 
 ```
-../postgresql-16-maludb-core_0.71.0-1_amd64.deb
-../postgresql-17-maludb-core_0.71.0-1_amd64.deb
-../postgresql-18-maludb-core_0.71.0-1_amd64.deb
-../maludb-mc2dbd_0.71.0-1_amd64.deb
-../maludb_0.71.0-1_amd64.changes
-../maludb_0.71.0-1_amd64.buildinfo
+../postgresql-18-maludb-core_0.106.0-1_amd64.deb
+../maludb-mc2dbd_0.106.0-1_amd64.deb
+../maludb_0.106.0-1_amd64.changes
+../maludb_0.106.0-1_amd64.buildinfo
 ```
 
 The `-dbgsym` debug-symbol packages (.ddeb) are produced too if
@@ -51,7 +47,7 @@ optional.
 ## Install
 
 ```bash
-sudo dpkg -i ../postgresql-17-maludb-core_*.deb ../maludb-mc2dbd_*.deb
+sudo dpkg -i ../postgresql-18-maludb-core_*.deb ../maludb-mc2dbd_*.deb
 sudo apt-get -f install   # pull dependencies if any are missing
 ```
 
@@ -65,11 +61,11 @@ so after configuring `/etc/maludb/maludb-mc2dbd.conf`.
 [debian/rules](../debian/rules):
 
 1. `override_dh_auto_build` — runs the top-level PGXS Makefile
-   targeting PG 17, then builds `mc2dbd/` (the listener).
+   targeting PG 18, then builds `mc2dbd/` (the listener).
 2. `override_dh_auto_install` — installs both into a shared
    `debian/tmp/` staging directory. `dh_install` then routes paths
    into each binary package using
-   `debian/postgresql-17-maludb-core.install` and
+   `debian/postgresql-18-maludb-core.install` and
    `debian/maludb-mc2dbd.install`. Helper scripts
    (`maludb-validate`, `maludb-gpu-check`,
    `maludb-model-runtime-check`) land under
@@ -87,7 +83,7 @@ so after configuring `/etc/maludb/maludb-mc2dbd.conf`.
 ## Multi-version support
 
 `debian/pgversions` lists the PG majors to build for (currently
-`16 17 18`). `debian/rules`'s `override_dh_auto_build` and
+`18` only). `debian/rules`'s `override_dh_auto_build` and
 `override_dh_auto_install` loop over the list, invoking the PGXS
 Makefile once per version with the correct `PG_CONFIG`. The
 artifacts land under `/usr/lib/postgresql/N/lib/` and
@@ -95,11 +91,11 @@ artifacts land under `/usr/lib/postgresql/N/lib/` and
 matching `postgresql-N-maludb-core` package by per-version
 `debian/postgresql-N-maludb-core.install` files.
 
-To narrow the build to a single PG version (e.g., a constrained
-operator who only runs PG 17), edit `debian/pgversions` before
-running `dpkg-buildpackage`. Build-deps include
-`postgresql-server-dev-{16,17,18}`; runtime-deps in each per-version
-`Depends:` stanza pin the matching pgvector/pgaudit/partman build.
+Adding another PG major means adding it to `debian/pgversions`, adding
+`postgresql-server-dev-N` to Build-Depends, and adding a
+`postgresql-N-maludb-core` stanza plus matching `.install` / `.postinst`
+files. Runtime-deps in the `Depends:` stanza pin the matching
+pgvector/pgaudit/partman build.
 
 ## Acceptance after install
 
@@ -107,22 +103,22 @@ running `dpkg-buildpackage`. Build-deps include
 sudo -u postgres createdb acc
 sudo -u postgres psql -d acc -c "CREATE EXTENSION maludb_core CASCADE"
 sudo -u postgres psql -d acc -c "SELECT maludb_core.maludb_core_version()"
-# expected: 0.71.0
+# expected: 0.106.0
 ```
 
 Then run a full regression in the source tree against the installed
 extension to confirm nothing slipped:
 
 ```bash
-make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
-# expected: All 74 tests passed.
+make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+# expected: All 104 tests passed.
 ```
 
 ## Known issues
 
-- The two PGDG dependency packages (`postgresql-17-pgaudit`,
-  `postgresql-17-partman`) are declared as `Depends:` on
-  `postgresql-17-maludb-core` even though only pgvector is strictly
+- The two PGDG dependency packages (`postgresql-18-pgaudit`,
+  `postgresql-18-partman`) are declared as `Depends:` on
+  `postgresql-18-maludb-core` even though only pgvector is strictly
   required for the extension to load. The other two are required at
   *runtime* for the doctrine guarantees (audit + partitioning) to
   hold. Operators that don't want them must remove the dep

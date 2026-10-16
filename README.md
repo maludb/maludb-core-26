@@ -2,7 +2,7 @@
 
 MaluDB is a memory DBMS for long-term institutional memory, human-AI
 knowledge sharing, and contextual recall. Built in **C** as PostgreSQL
-extensions on **Ubuntu 24.04 LTS**, with **PostgreSQL 17** (PGDG) as
+extensions on **Ubuntu 26.04 LTS**, with **PostgreSQL 18** (PGDG) as
 the foundation.
 
 **New here?** Start with the [executive summary](executive-summary.md) —
@@ -14,13 +14,13 @@ with vector search reserved for the query classes that genuinely need it.
 | | |
 |---|---|
 | Version | **0.106.0** (extension) — **the engine learns who is asking**: tenant-scoped principals and scope grants, three session settings (`maludb_core.principal_ref` / `principal_scopes` / `principal_readonly`; unset = unrestricted, as before), `principal_ref` + `scope` on source packages, documents, memories, episodes, chat sessions and pools, enforced for reads by a RESTRICTIVE policy and inside the SECURITY DEFINER search workers, for writes by trigger, with `sensitivity` checked against the principal's ceiling; **forgetting works** — tombstones are honoured on the `exact` and `exact_parallel` search paths (only `local_ann` filtered them, so a deleted memory stayed recallable), `maludb_forget_document()` / `maludb_forget_chunk()`, and a deleted document takes its chunks with it; skills gain `review_state`, principal grants and load events; pools gain presence facades; `maludb_memory_ingest_extraction` takes a namespace. Re-run `enable_memory_schema` per tenant after upgrading. On 0.105.3 **text comparisons use their indexes inside functions called with a `name` argument** (#35): PL/pgSQL gave such functions collation "C", so comparisons against the extension's default-collation indexes fell back to scanning — the dirty-queue purge fired per deleted statement read the whole queue, and memory search filtered every compartment of a schema; 17 functions now compare with `COLLATE "default"`, and the `collation_index_use` regress test lists any comparison with that shape. On 0.105.2 **bulk deletes no longer quadratic** (#33): indexes on `malu$svpor_statement.source_package_id`, `malu$community_membership.community_id` and `malu$ann_delta.chunk_id`, so deleting memory data, replacing communities and deleting ANN-indexed compartments no longer scan a child table per row; a new `fk_index_coverage` regress test lists every foreign key still without a usable index. On 0.105.1 **`malu_vector` text output reads back exactly** (#31): elements print as the shortest decimal that reproduces the float4, so `pg_dump`, `COPY` and client reads no longer round embeddings. On 0.105.0 **`pg_dump` carries MaluDB's data** (#27): data tables are registered with `pg_extension_config_dump`, so logical backups and dump/restore migrations keep what MaluDB stores and none of the rows the extension installs; the per-database master key and auth pepper are deliberately not dumped, and restores should run with `session_replication_role=replica` (see CHANGELOG). On 0.104.0 **relational data-model graph (DM-1)**: database objects become a graph namespace, so coding tools can ask "how do I join A to B" / "what breaks if I change X" through the same surface as the code graphs — `maludb_datamodel_refresh` introspects `pg_catalog` (tables/views/matviews with columns + PK attributes, routines, non-internal triggers, one node per schema) into node-link form and imports it via the 0.103.0 graph import: `fk_references`/`depends_on`/`triggers_on`/`belongs_to` edges as EXTRACTED, routine reads/writes via a coarse `prosrc` scan as INFERRED, visibility limited to the tenant's own schema plus `maludb_core` and `public`. Companion `maludb_datamodel_describe` returns live columns/PK/FKs-in-and-out for one relation, and graph import gains `options.resolve_external` (link endpoints matching an existing subject canonical name resolve — the cross-namespace stitch for code mining). On 0.103.0 **in-core graph import**: one-call `maludb_graph_import(namespace, graph jsonb, options jsonb)` — validates the namespace and caps (50k nodes / 200k links), registers node types idempotently (`concept` fallback), maps nodes → subjects (canonical `<ns>/<id>`, label alias, `graphify_*` attributes) and links → SVO edges (EXTRACTED/INFERRED/AMBIGUOUS → confidence 1.0/0.7/0.4) in one ingest call with per-item subtransaction isolation (unknown endpoints reported in `skipped`, not fatal); node community tags stored via community replace. Graph import is core functionality — every API server exposes it as a thin wrapper. On 0.102.0 **graph communities + analytics + subject-type registration**: `malu$community`/`malu$community_membership` (namespace-scoped community sets over graph objects, replace semantics per namespace; clustering itself stays client-side), facade `maludb_community_replace`, `uedge_degree` (in/out/total degree over `malu$edge_unified` — the god-nodes query), `uedge_surprises` (cross-community edges ranked by community-pair rarity), and tenant-callable idempotent `maludb_register_subject_type` into the global subject-type catalog. On 0.101.0 **unified-graph path finding**: `uedge_path(source, target, max_depth, direction, rel[])` over `malu$edge_unified`, shortest path first, direction defaulting to `both`, depth capped [1,32], with tenant facade `maludb_graph_path`. On 0.100.0 **document/note reindex protocol**: a background worker re-derives a document's or note's SVPOR graph footprint (subjects/verbs/SVO statements) against the current knowledge graph — `maludb_memory_reindex_claim` (stalest-first, registry-aware) → `maludb_memory_reindex_apply` (replace the `$source`-anchored statement footprint, then re-ingest idempotently), with `last_indexed`/`last_indexed_model` watermarks on `malu$document`; the documents/notes analogue of the 0.99.0 skill reindex, and likewise core never calls a model. Latest release tag `v4.5.0` shipped extension 0.100.0 on 2026-06-17; 0.101.0–0.105.0 are on `main` ahead of the next release tag. V4 acceptance suite: `scripts/maludb-fieldtest-v4` walks every V4 surface end-to-end; `bench/v4/run-bench` publishes recall + latency baselines; `docs/v4/acceptance-matrix.md` maps plan §12 criteria to test artefacts. |
-| Test suite | **97 pg_regress targets** on PG 17 plus restd, realtimed, CLI, libmaludb v0.2, and pageindexd parser smoke checks |
+| Test suite | **104 pg_regress targets** on PG 18 plus restd, realtimed, CLI, libmaludb v0.2, and pageindexd parser smoke checks |
 | Drivers | Python, Node.js, PHP, C — all four validated against the live extension |
 | External services | `maludb_modeld` (model gateway) + `maludb_mc2dbd` (database MCP listener) + `mcp-broker` (external-tool MCP broker) + `maludb-restd` (V3 REST gateway) + `maludb-realtimed` (V3 SSE event stream) + `maludb-pageindexd` (V4 PageIndex / ChatIndex builder) |
 | Roadmap | `requirements.md` §9 Stages 1–16+ shipped through V4 GA — see [`version4-pageindex-plan.md`](version4-pageindex-plan.md) |
 | Stage | Stages 1–15 (V3 GA + v3.1.0 follow-up) and Stage 16+ (V4 PageIndex / ChatIndex) shipped |
 | License | PostgreSQL License (BSD-style) |
-| Platforms | Ubuntu 24.04 LTS, x86_64 + arm64 |
+| Platforms | Ubuntu 26.04 LTS, x86_64 + arm64 |
 
 ## What's in it
 
@@ -74,10 +74,10 @@ A small number of invariants run through the whole system:
 Each block below is one step: copy it, run it, and check the result
 against the line underneath before moving on.
 
-**1. Install (Ubuntu 24.04 build host).**
+**1. Install (Ubuntu 26.04 build host).**
 
 Clone the repository and run the bootstrap. It builds and installs the
-`maludb_core` PostgreSQL extension (PostgreSQL 17 from PGDG, plus pgvector,
+`maludb_core` PostgreSQL extension (PostgreSQL 18 from PGDG, plus pgvector,
 pgaudit, and pg_partman) from source, then **creates the `maludb` database,
 installs the extension into it (`CREATE EXTENSION maludb_core`), and sets its
 `search_path`** — so on the default path you do not create the database or
@@ -85,7 +85,7 @@ the extension by hand:
 
 ```bash
 git clone https://github.com/maludb/maludb-core
-cd maludb-core
+cd maludb-core-26
 sudo scripts/maludb-bootstrap
 ```
 
@@ -243,7 +243,7 @@ per-schema respectively** — stopping early leaves the system in a mixed state:
 #    `make install`s the same filenames and silently downgrades
 #    default_version for every future CREATE EXTENSION on the host.
 cd <this-checkout> && git pull
-sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 
 # 2. PER DATABASE: update the extension in every database that has it.
 sudo -u postgres psql -d maludb -c "ALTER EXTENSION maludb_core UPDATE"
@@ -273,10 +273,10 @@ the database; all four are needed — if any one is missing, the
 connection fails.
 
 **1. Make PostgreSQL listen on the network.** This is the step that
-blocks everything else: Ubuntu's PostgreSQL 17 default is
+blocks everything else: Ubuntu's PostgreSQL 18 default is
 `listen_addresses = 'localhost'`, so remote clients get *connection
 refused* regardless of any `pg_hba.conf` or firewall setup. Edit
-`/etc/postgresql/17/main/postgresql.conf`:
+`/etc/postgresql/18/main/postgresql.conf`:
 
 ```conf
 listen_addresses = '*'        # or a specific address, e.g. '192.168.100.163'
@@ -298,7 +298,7 @@ sudo -u postgres psql -c "ALTER USER app PASSWORD '#change_on_install#'"
 ```
 
 **3. Allow the client in `pg_hba.conf`.** Add a `host` line to
-`/etc/postgresql/17/main/pg_hba.conf` for the application server's
+`/etc/postgresql/18/main/pg_hba.conf` for the application server's
 address (or subnet), then reload:
 
 ```conf

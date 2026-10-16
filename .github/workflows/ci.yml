@@ -12,17 +12,17 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------
-  # Main build + regression matrix. PG 16 and 17 are required; 18 is
-  # allowed-fail until we've validated the toolchain there.
+  # Main build + regression matrix. This repository targets Ubuntu 26.04
+  # (resolute) + PostgreSQL 18 only; the 24.04 / PG 16-17 line lives in
+  # maludb/maludb-core.
   # ---------------------------------------------------------------------
   pg-matrix:
     name: PG ${{ matrix.pg }} build + installcheck + mc2dbd
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
-        pg: ['16', '17', '18']
-    continue-on-error: ${{ matrix.pg == '18' }}
+        pg: ['18']
     env:
       PG_CONFIG: /usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
       PG_HBA: /etc/postgresql/${{ matrix.pg }}/main/pg_hba.conf
@@ -36,7 +36,7 @@ jobs:
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL "$PGDG_KEY_URL" \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "${VERSION_CODENAME}")-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           # Remove any preinstalled PG to free port 5432 for the PGDG version.
@@ -113,18 +113,18 @@ jobs:
 
   # ---------------------------------------------------------------------
   # Stage 8 (V3-DOC-01) — documentation/version consistency gate. Runs on
-  # ubuntu-24.04 without any PG install; the check is text-only.
+  # ubuntu-26.04 without any PG install; the check is text-only.
   # ---------------------------------------------------------------------
   doc-consistency:
     name: Doc / version consistency (V3-DOC-01)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - name: Run scripts/maludb-check-doc-consistency
         run: scripts/maludb-check-doc-consistency
 
   # ---------------------------------------------------------------------
-  # ASan + UBSan against the PG 17 default build. We preload libasan into
+  # ASan + UBSan against the PG 18 default build. We preload libasan into
   # the PG backend via a systemd drop-in so the sanitizer initializes
   # before PG's allocator wrappers run.
   #
@@ -133,31 +133,31 @@ jobs:
   # informational until it's been stabilized on a couple of runs.
   # ---------------------------------------------------------------------
   sanitizer:
-    name: ASan + UBSan (PG 17)
-    runs-on: ubuntu-24.04
+    name: ASan + UBSan (PG 18)
+    runs-on: ubuntu-26.04
     continue-on-error: true
     env:
-      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
-      PG_HBA: /etc/postgresql/17/main/pg_hba.conf
+      PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
+      PG_HBA: /etc/postgresql/18/main/pg_hba.conf
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PG 17 + pgvector + sanitizer runtime
+      - name: Install PG 18 + pgvector + sanitizer runtime
         run: |
           set -euxo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL "$PGDG_KEY_URL" \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "${VERSION_CODENAME}")-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo systemctl stop postgresql 2>/dev/null || true
           sudo apt-get purge -y 'postgresql-*' 'postgresql-client-*' 2>/dev/null || true
           sudo apt-get autoremove -y || true
           sudo apt-get install -y \
-            postgresql-17 postgresql-server-dev-17 postgresql-17-pgvector \
-            postgresql-17-pgaudit \
+            postgresql-18 postgresql-server-dev-18 postgresql-18-pgvector \
+            postgresql-18-pgaudit \
             build-essential pkg-config bison flex \
             libicu-dev libssl-dev libreadline-dev zlib1g-dev \
             libmicrohttpd-dev libjansson-dev libgnutls28-dev libcurl4-openssl-dev \
@@ -168,7 +168,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo sed -i -E 's#^local[[:space:]]+all[[:space:]]+(all|postgres)[[:space:]]+peer$#local all all trust#' "$PG_HBA"
-          sudo systemctl reload postgresql@17-main
+          sudo systemctl reload postgresql@18-main
 
       - name: Build maludb_core with -fsanitize=address,undefined
         run: |
@@ -188,8 +188,8 @@ jobs:
           ASAN_SO=$(gcc -print-file-name=libasan.so.8)
           echo "libasan: $ASAN_SO"
           test -e "$ASAN_SO" || { echo "libasan.so.8 not found"; exit 1; }
-          sudo mkdir -p /etc/systemd/system/postgresql@17-main.service.d
-          sudo tee /etc/systemd/system/postgresql@17-main.service.d/sanitizer.conf >/dev/null <<EOF
+          sudo mkdir -p /etc/systemd/system/postgresql@18-main.service.d
+          sudo tee /etc/systemd/system/postgresql@18-main.service.d/sanitizer.conf >/dev/null <<EOF
           [Service]
           Environment="LD_PRELOAD=${ASAN_SO}"
           Environment="ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:print_stacktrace=1:strict_string_checks=1:check_initialization_order=1"
@@ -205,10 +205,10 @@ jobs:
             "${ASAN_SO}" \
             "detect_leaks=0:abort_on_error=1:print_stacktrace=1:strict_string_checks=1:check_initialization_order=1" \
             "print_stacktrace=1:halt_on_error=1" \
-            | sudo tee -a /etc/postgresql/17/main/environment >/dev/null
-          sudo cat /etc/postgresql/17/main/environment
+            | sudo tee -a /etc/postgresql/18/main/environment >/dev/null
+          sudo cat /etc/postgresql/18/main/environment
           sudo systemctl daemon-reload
-          sudo systemctl restart postgresql@17-main
+          sudo systemctl restart postgresql@18-main
           # Give the cluster a moment to be ready after restart.
           for _ in $(seq 1 20); do
             if psql -h /var/run/postgresql -U postgres -c "SELECT 1;" >/dev/null 2>&1; then
@@ -241,8 +241,8 @@ jobs:
         # Debian/Ubuntu cluster wrapper sends to this file rather than the
         # journal -- without it the job fails with no reason shown.
         run: |
-          sudo journalctl -u postgresql@17-main --no-pager -n 500 || true
-          sudo tail -n 400 /var/log/postgresql/postgresql-17-main.log || true
+          sudo journalctl -u postgresql@18-main --no-pager -n 500 || true
+          sudo tail -n 400 /var/log/postgresql/postgresql-18-main.log || true
 
   # ---------------------------------------------------------------------
   # clang-tidy + scan-build over src/. Reports only — not gating yet.
@@ -250,33 +250,33 @@ jobs:
   # have a clean baseline (likely a follow-up .clang-tidy config).
   # ---------------------------------------------------------------------
   static-analysis:
-    name: clang-tidy + scan-build (PG 17)
-    runs-on: ubuntu-24.04
+    name: clang-tidy + scan-build (PG 18)
+    runs-on: ubuntu-26.04
     continue-on-error: true
     env:
-      PG_CONFIG: /usr/lib/postgresql/17/bin/pg_config
+      PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PG 17 dev headers + clang static analysis
+      - name: Install PG 18 dev headers + clang static analysis
         run: |
           set -euxo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL "$PGDG_KEY_URL" \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "${VERSION_CODENAME}")-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
           sudo apt-get install -y \
-            postgresql-server-dev-17 \
-            build-essential clang-18 clang-tidy-18 clang-tools-18 \
+            postgresql-server-dev-18 \
+            build-essential clang-21 clang-tidy-21 clang-tools-21 \
             pkg-config
 
       - name: clang-tidy on src/*.c
         run: |
           set -euxo pipefail
-          clang-tidy-18 \
+          clang-tidy-21 \
             --header-filter='^src/' \
             src/*.c \
             -- \
@@ -288,7 +288,7 @@ jobs:
         run: |
           set -euxo pipefail
           make clean
-          scan-build-18 -o scan-build-report \
+          scan-build-21 -o scan-build-report \
             make PG_CONFIG="$PG_CONFIG" || true
 
       - name: Upload scan-build report

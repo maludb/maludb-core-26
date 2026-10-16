@@ -3,7 +3,7 @@
 ### Builds the C sidecar that exposes MaluDB as an MCP-compatible HTTP
 ### endpoint (default https://localhost:5329).
 ###
-### Build deps on Ubuntu 24.04:
+### Build deps on Ubuntu 26.04:
 ###   sudo apt-get install -y libpq-dev libmicrohttpd-dev libjansson-dev libgnutls28-dev libcurl4-openssl-dev pkg-config
 ###
 ### Build:    make -C mc2dbd
@@ -23,7 +23,7 @@ SBINDIR      ?= $(PREFIX)/sbin
 SYSCONFDIR   ?= /etc/maludb
 SYSTEMD_UNIT_DIR ?= /etc/systemd/system
 
-PG_CONFIG    ?= /usr/lib/postgresql/17/bin/pg_config
+PG_CONFIG    ?= /usr/lib/postgresql/18/bin/pg_config
 PG_INCDIR    := $(shell $(PG_CONFIG) --includedir)
 PG_LIBDIR    := $(shell $(PG_CONFIG) --libdir)
 

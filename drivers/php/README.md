@@ -16,7 +16,7 @@ in later versions.
 | Extensions | `ext-pdo`, `ext-pdo_pgsql`, `ext-json` |
 | PostgreSQL | maludb_core 0.41.0+ installed in the target DB |
 
-On Ubuntu 24.04, install PHP, the PostgreSQL PDO driver, the PostgreSQL
+On Ubuntu 26.04, install PHP, the PostgreSQL PDO driver, the PostgreSQL
 client, and `unzip` so Composer can extract package archives:
 
 ```bash
@@ -70,8 +70,8 @@ Use this source tree only when developing the driver itself or running its
 examples and tests:
 
 ```bash
-git clone https://github.com/maludb/maludb-core.git
-cd maludb-core/drivers/php
+git clone https://github.com/maludb/maludb-core-26.git
+cd maludb-core-26/drivers/php
 composer install
 ```
 

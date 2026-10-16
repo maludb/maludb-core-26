@@ -17,7 +17,7 @@ DB="${1:-maludb_bench}"
 DURATION="${2:-30}"
 CLIENTS="${3:-4}"
 JOBS="${JOBS:-${CLIENTS}}"
-PG_BIN="${PG_BIN:-/usr/lib/postgresql/17/bin}"
+PG_BIN="${PG_BIN:-/usr/lib/postgresql/18/bin}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULT_DIR="${SCRIPT_DIR}/results"
 

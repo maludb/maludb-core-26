@@ -4,8 +4,6 @@ Priority: optional
 Maintainer: Edward Honour <ed@maludb.org>
 Build-Depends: debhelper-compat (= 13),
                postgresql-server-dev-all (>= 217~),
-               postgresql-server-dev-16,
-               postgresql-server-dev-17,
                postgresql-server-dev-18,
                libpq-dev,
                libmicrohttpd-dev,
@@ -14,34 +12,21 @@ Build-Depends: debhelper-compat (= 13),
                libcurl4-openssl-dev,
                pkg-config
 Standards-Version: 4.6.2
-Homepage: https://github.com/maludb/maludb-core
-Vcs-Git: https://github.com/maludb/maludb-core.git
-Vcs-Browser: https://github.com/maludb/maludb-core
+Homepage: https://github.com/maludb/maludb-core-26
+Vcs-Git: https://github.com/maludb/maludb-core-26.git
+Vcs-Browser: https://github.com/maludb/maludb-core-26
 Rules-Requires-Root: no
 
-Package: postgresql-16-maludb-core
+Package: postgresql-18-maludb-core
 Architecture: any
-Pre-Depends: postgresql-16
+Pre-Depends: postgresql-18
 Depends: ${shlibs:Depends},
          ${misc:Depends},
-         postgresql-16,
-         postgresql-16-pgvector,
-         postgresql-16-pgaudit,
-         postgresql-16-partman
-Description: MaluDB memory core — PostgreSQL 16 extension
- PostgreSQL 16 build of the maludb_core extension. See the
- postgresql-17-maludb-core package for the full feature description.
-
-Package: postgresql-17-maludb-core
-Architecture: any
-Pre-Depends: postgresql-17
-Depends: ${shlibs:Depends},
-         ${misc:Depends},
-         postgresql-17,
-         postgresql-17-pgvector,
-         postgresql-17-pgaudit,
-         postgresql-17-partman
-Description: MaluDB memory core — PostgreSQL 17 extension
+         postgresql-18,
+         postgresql-18-pgvector,
+         postgresql-18-pgaudit,
+         postgresql-18-partman
+Description: MaluDB memory core — PostgreSQL 18 extension
  MaluDB is a memory DBMS for long-term institutional memory, human-AI
  knowledge sharing, and contextual recall. This package provides the
  maludb_core extension (migration chain through 0.95.0):
@@ -72,25 +57,12 @@ Description: MaluDB memory core — PostgreSQL 17 extension
     entity-card embeddings with a trigger-fed dirty queue and opt-in
     similarity jumps in graph traversal.
 
-Package: postgresql-18-maludb-core
-Architecture: any
-Pre-Depends: postgresql-18
-Depends: ${shlibs:Depends},
-         ${misc:Depends},
-         postgresql-18,
-         postgresql-18-pgvector,
-         postgresql-18-pgaudit,
-         postgresql-18-partman
-Description: MaluDB memory core — PostgreSQL 18 extension
- PostgreSQL 18 build of the maludb_core extension. See the
- postgresql-17-maludb-core package for the full feature description.
-
 Package: maludb-mc2dbd
 Architecture: any
 Pre-Depends: adduser
 Depends: ${shlibs:Depends},
          ${misc:Depends},
-         postgresql-17-maludb-core (>= ${source:Version})
+         postgresql-18-maludb-core (>= ${source:Version})
 Recommends: ca-certificates
 Description: MaluDB MC2DB listener (MCP-over-HTTPS sidecar)
  The maludb_mc2dbd daemon exposes the MaluDB MC2DB tool registry as

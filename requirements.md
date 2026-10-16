@@ -117,17 +117,17 @@ V4 release tagging targets `v4.0.0` once every V4 ticket in §9 Stages 16+ reach
 
 | Item | Target |
 |---|---|
-| OS | Ubuntu 24.04 LTS (Noble Numbat), x86_64 and arm64 |
-| Database | PostgreSQL 17 from the **PGDG apt repository** (`apt.postgresql.org`), installed and configured by the default MaluDB installation bundle |
+| OS | Ubuntu 26.04 LTS (Resolute Raccoon), x86_64 and arm64 |
+| Database | PostgreSQL 18 from the **PGDG apt repository** (`apt.postgresql.org`), installed and configured by the default MaluDB installation bundle |
 | Language (server-side extensions) | C, **C11** standard |
 | Language (in-DB stored procedures) | SQL, PL/pgSQL; PL/Python sandboxed where required |
 | Model runtime | `llama.cpp` / `libllama` is the first local reference candidate; cloud model providers use the same MaluDB session/request/response contract through provider adapters |
-| Compiler | gcc 13.x default; Clang 18 for sanitizer/static-analysis builds |
+| Compiler | gcc 15.x default; Clang 21 for sanitizer/static-analysis builds |
 | Build system | **PGXS Makefile** for extensions; `pg_buildext` / `dh_make_pgxs` for Debian packaging |
-| LLVM JIT | LLVM 18 (Ubuntu 24.04 default) |
+| LLVM JIT | LLVM 21 (Ubuntu 26.04 default; used by PGDG PostgreSQL 18) |
 | License | **PostgreSQL License** (BSD-style) for own code; permissive deps only |
 
-PG 16 must build cleanly through the same matrix to support migration. PostgreSQL 18 is now an official supported PostgreSQL release series; PG 18 compatibility is a CI target once PGDG `noble` packages and required extension packages are validated. The product baseline and minimum supported runtime remain PG 17 until the project explicitly decides to bump them.
+This repository (maludb-core-26) targets PostgreSQL 18 on Ubuntu 26.04 only; PGDG `resolute-pgdg` ships PostgreSQL 18 and the required pgvector, pgaudit and pg_partman packages, and CI runs on the GitHub Actions `ubuntu-26.04` runner. The Ubuntu 24.04 / PostgreSQL 16–17 line, including the earlier PG 17-baseline decision, is maintained in [maludb/maludb-core](https://github.com/maludb/maludb-core).
 
 The default installation MUST NOT require operators to provision PostgreSQL manually before installing MaluDB. MaluDB packages, containers, or deployment bundles MUST declare, install, configure, and validate the required PostgreSQL base and PostgreSQL extensions as part of the MaluDB install path. An advanced installation mode MAY target an existing compatible PostgreSQL cluster when the operator explicitly chooses that mode.
 

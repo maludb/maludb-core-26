@@ -23,7 +23,7 @@
 #   --all-schemas        (re-)enable every schema in malu$enabled_schema instead
 #                        of a single -s/--schema (loops the enable step)
 #   --pg-config PATH     pg_config to build/install against
-#                        (default: $PG_CONFIG or /usr/lib/postgresql/17/bin/pg_config)
+#                        (default: $PG_CONFIG or /usr/lib/postgresql/18/bin/pg_config)
 #   --skip-install       skip step 1 (make install); do the DB upgrade + enable only
 #   --repo PATH          repo root (default: the script's repo)
 #   --conninfo STR       explicit libpq conninfo for the SQL steps (overrides probing)
@@ -46,7 +46,7 @@ EXT=maludb_core
 VERSION=""
 DB_NAME=""
 SCHEMA=""
-PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/17/bin/pg_config}"
+PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/18/bin/pg_config}"
 PG_CONNINFO="${PG_CONNINFO:-}"
 SKIP_INSTALL=0
 ALL_SCHEMAS=0

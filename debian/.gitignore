@@ -9,8 +9,6 @@ files
 tmp/
 
 # Per-package staging trees populated by dh_install.
-postgresql-16-maludb-core/
-postgresql-17-maludb-core/
 postgresql-18-maludb-core/
 maludb-mc2dbd/
 

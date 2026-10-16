@@ -60,7 +60,7 @@ endpoint's `handler_function` body.
 ## Smoke test
 
 ```bash
-make installcheck PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+make installcheck PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 cd services/maludb-restd
 PYTHONPATH=src python3 -m pytest tests/
 ```

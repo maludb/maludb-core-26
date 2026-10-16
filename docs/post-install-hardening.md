@@ -222,7 +222,7 @@ fail.
 
 | Component | Log destination |
 |---|---|
-| PostgreSQL | `/var/log/postgresql/postgresql-17-main.log` |
+| PostgreSQL | `/var/log/postgresql/postgresql-18-main.log` |
 | `maludb-mc2dbd` | `journalctl -u maludb-mc2dbd` |
 | `maludb-modeld` | `journalctl -u maludb-modeld` |
 | MC2DB tool calls (audit) | `maludb_core.malu$mc2db_invocation` |
@@ -283,9 +283,9 @@ MaluDB ships versioned PostgreSQL extension migration scripts. To move
 an existing database to the installed package's default version:
 
 ```bash
-cd ~/maludb-core
+cd ~/maludb-core-26
 git pull
-sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 
 pg_dump maludb > maludb-pre-upgrade.dump
 sudo -u postgres psql -d maludb -c "ALTER EXTENSION maludb_core UPDATE;"
