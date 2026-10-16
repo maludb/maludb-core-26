@@ -26,7 +26,7 @@ debian/*.debhelper.log
 debian/*.debhelper
 debian/*.substvars
 debian/maludb-mc2dbd/
-debian/postgresql-17-maludb-core/
+debian/postgresql-18-maludb-core/
 debian/tmp/
 
 # Claude Code local settings

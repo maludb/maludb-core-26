@@ -1,20 +1,19 @@
 #!/usr/bin/make -f
 # Debian rules for the maludb source package.
 #
-# Builds four binary packages:
-#   postgresql-16-maludb-core  — PGXS extension for PG 16
-#   postgresql-17-maludb-core  — PGXS extension for PG 17
+# Builds two binary packages (Ubuntu 26.04 / PostgreSQL 18):
 #   postgresql-18-maludb-core  — PGXS extension for PG 18
 #   maludb-mc2dbd              — MC2DB listener daemon + systemd unit
 #
-# The per-PG-version loop is driven by pg_buildext. Versions to
-# build are listed in debian/pgversions.
+# The per-PG-version loop is driven by debian/pgversions (18 only).
+# mc2dbd links libpq from the newest listed version.
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 # pg_buildext picks up the per-version PG_CONFIG by reading
 # debian/pgversions and invoking the right make per pass.
 PG_VERSIONS := $(shell cat debian/pgversions | grep -v '^\#' | tr '\n' ' ')
+PG_MC2DBD   := $(lastword $(PG_VERSIONS))
 
 %:
 	dh $@
@@ -31,7 +30,7 @@ override_dh_auto_build:
 	    $(MAKE) -C . clean PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config || true; \
 	    $(MAKE) PG_CONFIG=/usr/lib/postgresql/$$v/bin/pg_config; \
 	done
-	$(MAKE) -C mc2dbd PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+	$(MAKE) -C mc2dbd PG_CONFIG=/usr/lib/postgresql/$(PG_MC2DBD)/bin/pg_config
 
 override_dh_auto_install:
 	# Stage every PG version's artifacts into a shared debian/tmp/
@@ -49,7 +48,7 @@ override_dh_auto_install:
 	done
 	# Listener and helper scripts.
 	$(MAKE) -C mc2dbd install \
-	    PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config \
+	    PG_CONFIG=/usr/lib/postgresql/$(PG_MC2DBD)/bin/pg_config \
 	    DESTDIR=$(CURDIR)/debian/tmp
 	# Helper scripts into maludb-mc2dbd's docs path so operators
 	# have something to run after `apt install`. The validate script
@@ -75,7 +74,7 @@ override_dh_installsystemd:
 	#
 	# `-p maludb-mc2dbd` targets the listener binary package; without
 	# it the unit would land in the alphabetically-first package
-	# (postgresql-17-maludb-core, wrong).
+	# (postgresql-18-maludb-core, wrong).
 	sed -e 's|/usr/local/sbin/maludb_mc2dbd|/usr/sbin/maludb_mc2dbd|g' \
 	    -e 's|^User=maludb_mc2dbd|User=maludb-mc2dbd|' \
 	    -e 's|^Group=maludb$$|Group=maludb-mc2dbd|' \

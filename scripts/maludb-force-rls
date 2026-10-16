@@ -30,7 +30,7 @@
 set -euo pipefail
 
 DB_NAME="${DB_NAME:-maludb}"
-PG_BIN="${PG_BIN:-/usr/lib/postgresql/17/bin}"
+PG_BIN="${PG_BIN:-/usr/lib/postgresql/18/bin}"
 
 cmd="${1:-}"
 case "$cmd" in

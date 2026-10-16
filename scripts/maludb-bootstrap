@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# maludb-bootstrap — Ubuntu 24.04 bootstrap for MaluDB Release 1.0.
+# maludb-bootstrap — Ubuntu 26.04 / PostgreSQL 18 bootstrap for MaluDB.
 # Phase R1.0-9.
 #
 # Idempotent. Safe to run multiple times. Skips steps that are already
@@ -17,7 +17,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/17/bin/pg_config}"
+PG_MAJOR="${PG_MAJOR:-18}"
+PG_CONFIG="${PG_CONFIG:-/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config}"
 DB_NAME="${DB_NAME:-maludb}"
 DB_OWNER="${DB_OWNER:-${USER:-maludb}}"
 SERVICE_USER="${SERVICE_USER:-maludb_mc2dbd}"
@@ -39,11 +40,12 @@ Usage: sudo $0 [--dry-run]
   --dry-run / -n   print the install plan and exit without changes
 
 Environment:
-  PG_CONFIG       path to pg_config (default /usr/lib/postgresql/17/bin/pg_config)
+  PG_MAJOR        PostgreSQL major version (default 18)
+  PG_CONFIG       path to pg_config (default /usr/lib/postgresql/\$PG_MAJOR/bin/pg_config)
   DB_NAME         MaluDB-owned database name (default maludb)
   SERVICE_USER    listener service OS user (default maludb_mc2dbd)
   MODELD_USER     gateway service OS user (default maludb_modeld)
-  MALUDB_FORCE_OS=1   silence non-Ubuntu-24.04 prompt
+  MALUDB_FORCE_OS=1   silence non-Ubuntu-26.04 prompt
 EOH
             exit 0 ;;
     esac
@@ -51,13 +53,13 @@ done
 
 if [ "$DRY_RUN" -eq 1 ]; then
     cat <<PLAN
-maludb-bootstrap will, on a clean Ubuntu 24.04 host:
+maludb-bootstrap will, on a clean Ubuntu 26.04 host:
 
-  1.  Verify the OS is Ubuntu 24.04
+  1.  Verify the OS is Ubuntu 26.04
   2.  Configure the PGDG apt repo (if not already)
   3.  apt install:
-        postgresql-17, postgresql-server-dev-17, postgresql-17-pgvector,
-        postgresql-17-pgaudit, postgresql-17-partman,
+        postgresql-${PG_MAJOR}, postgresql-server-dev-${PG_MAJOR}, postgresql-${PG_MAJOR}-pgvector,
+        postgresql-${PG_MAJOR}-pgaudit, postgresql-${PG_MAJOR}-partman,
         build-essential, pkg-config, cmake,
         libpq-dev, libmicrohttpd-dev, libjansson-dev, libgnutls28-dev,
         libcurl4-openssl-dev, openssl, jq, curl
@@ -104,15 +106,15 @@ section "Preflight"
 
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "24.04" ]; then
-        warn "Detected ${PRETTY_NAME:-unknown OS}; R1.0 targets Ubuntu 24.04"
+    if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "26.04" ]; then
+        warn "Detected ${PRETTY_NAME:-unknown OS}; MaluDB targets Ubuntu 26.04"
         warn "Continuing — set MALUDB_FORCE_OS=1 to silence in non-interactive use"
         if [ "${MALUDB_FORCE_OS:-0}" != "1" ] && [ -t 0 ]; then
             read -r -p "    Continue anyway? [y/N] " ans
             [ "${ans:-N}" = "y" ] || [ "${ans:-N}" = "Y" ] || die "Aborted"
         fi
     else
-        ok "Ubuntu 24.04 detected"
+        ok "Ubuntu 26.04 detected"
     fi
 fi
 
@@ -124,13 +126,22 @@ ok "Repo root: $REPO_ROOT"
 # ---------------------------------------------------------------------
 section "Installing apt dependencies"
 
-if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
+# Accept either the legacy one-line pgdg.list or the deb822 pgdg.sources
+# that Ubuntu 26.04 (and postgresql-common's apt.postgresql.org.sh) write;
+# adding a second PGDG entry with a different Signed-By breaks apt.
+if [ ! -f /etc/apt/sources.list.d/pgdg.list ] && [ ! -f /etc/apt/sources.list.d/pgdg.sources ]; then
     need_root "PGDG repo install"
     install -d /usr/share/postgresql-common/pgdg
+    PGDG_SUITE="$(. /etc/os-release && echo "${VERSION_CODENAME}")-pgdg"
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
-    echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
-        > /etc/apt/sources.list.d/pgdg.list
+    cat > /etc/apt/sources.list.d/pgdg.sources <<EOS
+Types: deb
+URIs: https://apt.postgresql.org/pub/repos/apt
+Suites: ${PGDG_SUITE}
+Components: main
+Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+EOS
     apt-get -q update
     ok "PGDG repo configured"
 else
@@ -152,8 +163,8 @@ apt_install() {
 }
 
 apt_install \
-    postgresql-17 postgresql-server-dev-17 \
-    postgresql-17-pgvector postgresql-17-pgaudit postgresql-17-partman \
+    postgresql-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} \
+    postgresql-${PG_MAJOR}-pgvector postgresql-${PG_MAJOR}-pgaudit postgresql-${PG_MAJOR}-partman \
     build-essential pkg-config cmake \
     libpq-dev libmicrohttpd-dev libjansson-dev libgnutls28-dev \
     libcurl4-openssl-dev openssl jq curl
@@ -183,7 +194,7 @@ ok "maludb_core installed"
 # ---------------------------------------------------------------------
 section "Configuring pgaudit preload"
 
-PG_VER=17
+PG_VER=$PG_MAJOR
 PG_CLUSTER=main
 
 pg_conf_show() {

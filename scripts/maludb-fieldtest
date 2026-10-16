@@ -103,10 +103,10 @@ echo "  out_dir:  $OUT_DIR"
 banner 1 "Provisioning preflight"
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    if [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_ID:-}" = "24.04" ]; then
-        ok "Ubuntu 24.04 detected"
+    if [ "${ID:-}" = "ubuntu" ] && [ "${VERSION_ID:-}" = "26.04" ]; then
+        ok "Ubuntu 26.04 detected"
     else
-        wn "Detected ${PRETTY_NAME:-unknown}; R1.0 targets Ubuntu 24.04"
+        wn "Detected ${PRETTY_NAME:-unknown}; MaluDB targets Ubuntu 26.04"
     fi
 fi
 
@@ -124,12 +124,12 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# 3. PG 17, pgvector, maludb_core
+# 3. PG 18, pgvector, maludb_core
 # ---------------------------------------------------------------------
-banner 3 "PostgreSQL 17, pgvector, maludb_core"
+banner 3 "PostgreSQL 18, pgvector, maludb_core"
 PG_VER=$(q "SELECT current_setting('server_version')")
 PG_MAJOR=${PG_VER%%.*}
-[ "$PG_MAJOR" = "17" ] && ok "PG ${PG_VER}" || ko "PG major ${PG_MAJOR} (want 17)"
+[ "$PG_MAJOR" = "18" ] && ok "PG ${PG_VER}" || ko "PG major ${PG_MAJOR} (want 18)"
 VEC_VER=$(q "SELECT extversion FROM pg_extension WHERE extname='vector'")
 [ -n "$VEC_VER" ] && ok "pgvector ${VEC_VER}" || ko "pgvector missing"
 ok "maludb_core $EXTVER"
