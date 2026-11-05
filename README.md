@@ -5,6 +5,18 @@ knowledge sharing, and contextual recall. Built in **C** as PostgreSQL
 extensions on **Ubuntu 26.04 LTS**, with **PostgreSQL 18** (PGDG) as
 the foundation.
 
+This repository is the engine's main line: Ubuntu 26.04 LTS and
+PostgreSQL 18. The Ubuntu 24.04 / PostgreSQL 17 line is
+[maludb/maludb-core](https://github.com/maludb/maludb-core), kept for the
+hosting VMs that run it and taking fixes only.
+
+**On MaluOS you do not build this.** MaluOS carries the engine as the
+packages `postgresql-18-maludb-core` and `maludb-mc2dbd`, and its first
+boot creates the database, the extension and the tenant. The operator's
+path across MaluOS, the Business OS kernel and its applications is the
+[handbook](https://github.com/maludb/maluos-docs); the Quickstart below
+is for a plain Ubuntu 26.04 build host.
+
 **New here?** Start with the [executive summary](executive-summary.md) —
 what MaluDB is, the memory model, and why retrieval is relational/graph-first
 with vector search reserved for the query classes that genuinely need it.
@@ -84,14 +96,15 @@ installs the extension into it (`CREATE EXTENSION maludb_core`), and sets its
 the extension by hand:
 
 ```bash
-git clone https://github.com/maludb/maludb-core
+git clone https://github.com/maludb/maludb-core-26
 cd maludb-core-26
+git submodule update --init --recursive
 sudo scripts/maludb-bootstrap
 ```
 
 You should see: the bootstrap finishes with a `Next steps:` checklist
 (optional services, post-install validator, listener smoke test). Run the
-remaining steps from this `maludb-core` checkout — that's where the
+remaining steps from this `maludb-core-26` checkout — that's where the
 `examples/` scripts step 3 uses live.
 
 > **Using a different or existing database?** Step 1 already created the
@@ -115,7 +128,7 @@ remaining steps from this `maludb-core` checkout — that's where the
 sudo -u postgres psql -d maludb -tAc "SELECT maludb_core.maludb_core_version()"
 ```
 
-You should see exactly: `0.104.0`
+You should see exactly: `0.106.0`
 
 **3. Walk through the first scenario (optional).**
 
@@ -202,7 +215,7 @@ You should see one row:
 ```
  schema_name | enabled_version | object_count
 -------------+-----------------+--------------
- app         | 0.104.0         |          165
+ app         | 0.106.0         |          190
 ```
 
 **5. Verify the schema works as the application user.**
